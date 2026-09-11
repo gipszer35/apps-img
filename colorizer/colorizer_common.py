@@ -6,9 +6,10 @@ import torchvision.transforms as T
 import matplotlib.pyplot as plt
 import os
 from torch.utils.data import DataLoader
-import my_common as my
+import common
+import image_utils
 
-logger = my.create_logger()
+logger = common.create_logger()
 
 
 class DataLoaderFactory:
@@ -41,7 +42,7 @@ class DataLoaderFactory:
                     saturation=0.15,
                     hue=0.05,
                 ),
-                my.normalize_transform(),
+                image_utils.normalize_transform(),
             ]
         )
 
@@ -69,7 +70,7 @@ class Visualizer:
     ):
         def prepare_image(image):
             if isinstance(image, torch.Tensor):
-                image = my.denormalize(image)
+                image = image_utils.denormalize(image)
                 image = image.detach().cpu()
 
                 if image.ndim == 3 and image.shape[0] in (1, 3):
@@ -133,7 +134,7 @@ class ColorizerTrainerBase:
         logger.info(f"\n:::Colorizer model:::\n")
         if os.path.exists(self.checkpoint_path):
             logger.info("Load model checkpoint")
-            checkpoint = torch.load(self.checkpoint_path, map_location=my.DEVICE)
+            checkpoint = torch.load(self.checkpoint_path, map_location=common.DEVICE)
             self.model.load_state_dict(checkpoint["model_state"])
         else:
             checkpoint = None
@@ -152,4 +153,4 @@ class ColorizerTrainerBase:
             logger.info("No checkpoint found — initialized new model and optimizer.")
             self.step = 0
 
-        my.print_parameter_summary(self.model)
+        common.print_parameter_summary(self.model)

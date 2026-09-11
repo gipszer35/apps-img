@@ -60,10 +60,11 @@ if is_colab():
 
 sys.path.append(config.work_dir)
 sys.path.append(config.root_dir)
-import my_common as my
+import common
+import image_utils
 import colorizer_common as cc
 
-logger = my.create_logger()
+logger = common.create_logger()
 
 
 class UNetColorizer(nn.Module):
@@ -181,10 +182,10 @@ class ColorizerTrainer(cc.ColorizerTrainerBase):
     def __init__(self, model, num_epochs):
         super().__init__(model, config.lr)
         self.step = 0
-        self.criterion = my.SRLoss(perceptual_weight=0.1)
-        self.multi_loss_tracker = my.MultiLossTracker()
+        self.criterion = image_utils.SRLoss(perceptual_weight=0.1)
+        self.multi_loss_tracker = image_utils.MultiLossTracker()
 
-        dataset = my.cropped_dataset(
+        dataset = image_utils.cropped_dataset(
             config.images_dir,
             crop_size=config.image_size,
             max_num_patches_per_image=1,
@@ -199,7 +200,7 @@ class ColorizerTrainer(cc.ColorizerTrainerBase):
         self.checkpoint_path = config.checkpoint_path
 
     def train_step(self, real, epoch):
-        real = real.to(my.DEVICE)
+        real = real.to(common.DEVICE)
 
         # Extract grayscale target and generate 8x8 low-res color hint
         gray = T.functional.rgb_to_grayscale(real, num_output_channels=1)
@@ -263,7 +264,7 @@ class ColorizerTrainer(cc.ColorizerTrainerBase):
 
 
 def train():
-    model = UNetColorizer().to(my.DEVICE)
+    model = UNetColorizer().to(common.DEVICE)
     trainer = ColorizerTrainer(model, num_epochs=100000)
     trainer.load_or_init()
     trainer.train()
