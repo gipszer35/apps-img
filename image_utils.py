@@ -9,10 +9,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torchvision.models as models
 import torch.nn.functional as NNF
+import random
 
 
 def normalize_transform():
     return transforms.Compose([transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+
+
+class Random90Rotation:
+    """Custom transform to rotate images into one of the 4 cardinal directions (0, 90, 180, 270 degrees)."""
+
+    def __call__(self, img):
+        # Randomly choose to rotate 0, 1, 2, or 3 times by 90 degrees
+        k = random.choice([0, 1, 2, 3])
+        return transforms.functional.rotate(img, k * 90)
 
 
 class VGGPerceptualLoss(nn.Module):
@@ -60,6 +70,7 @@ def load_images_cropped(
     crop_size,
     max_num_patches_per_image,
     keep_first_full_scale,
+    grayscale=False,
 ):
     image_paths = [
         os.path.join(directory_path, fname)
@@ -73,8 +84,11 @@ def load_images_cropped(
         try:
             # Image is automatically closed when leaving this block
             with Image.open(path) as img:
-                img = img.convert("RGB")
+                # Use grayscale ("L") or RGB
+                img = img.convert("L" if grayscale else "RGB")
                 w, h = img.size
+
+                num_channels = 1 if grayscale else 3
 
                 seen = set()
                 attempts = 0
@@ -124,9 +138,7 @@ def load_images_cropped(
 
                     seen.add(patch_id)
 
-                    # Crop directly from PIL.
-                    # This avoids converting the entire resized image
-                    # to a large torch tensor.
+                    # Crop directly from PIL
                     crop = resized.crop(
                         (
                             left,
@@ -136,12 +148,13 @@ def load_images_cropped(
                         )
                     )
 
-                    # Convert ONLY the crop to torch tensor [C, H, W]
+                    # Convert ONLY the crop to torch tensor
                     crop_tensor = torch.ByteTensor(
                         torch.ByteStorage.from_buffer(crop.tobytes())
                     )
+
                     crop_tensor = (
-                        crop_tensor.view(crop_size, crop_size, 3)
+                        crop_tensor.view(crop_size, crop_size, num_channels)
                         .permute(2, 0, 1)
                         .to(torch.float32)
                         / 255.0
@@ -164,7 +177,10 @@ def load_images_cropped(
     if cropped_images:
         return torch.stack(cropped_images)
     else:
-        return torch.empty((0, 3, crop_size, crop_size), dtype=torch.float32)
+        return torch.empty(
+            (0, 1 if grayscale else 3, crop_size, crop_size),
+            dtype=torch.float32,
+        )
 
 
 def cropped_dataset(
@@ -173,6 +189,7 @@ def cropped_dataset(
     max_num_patches_per_image=1,
     transform=None,
     keep_first_full_scale=False,
+    grayscale=False,
 ):
     # Load the clean [N, 3, H, W] tensor using the existing function
     cropped_tensor = load_images_cropped(
@@ -180,6 +197,7 @@ def cropped_dataset(
         crop_size,
         max_num_patches_per_image,
         keep_first_full_scale,
+        grayscale,
     )
     if transform:
         cropped_tensor = transform(cropped_tensor)
