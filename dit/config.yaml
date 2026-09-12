@@ -1,0 +1,63 @@
+trainers:
+  latent_small:
+    use_latent: true
+    image_size: 0
+    raw_crop_size: 512
+    latent_image_size: 32
+    num_heads: 8
+    dim: 512
+    depth: 10
+    num_timesteps: 600
+    check_point_name: "DiT.vae.pt"
+    patch: 2
+
+  latent_large:
+    use_latent: true
+    image_size: 0
+    raw_crop_size: 896  # 512 + 256 + 128
+    latent_image_size: 96
+    num_heads: 8
+    dim: 512
+    depth: 10
+    num_timesteps: 600
+    check_point_name: "DiT.vae.768.pt"
+    patch: 2
+
+  refiner_256:
+    use_latent: false
+    image_size: 256
+    raw_crop_size: 0
+    latent_image_size: 0
+    num_heads: 8
+    dim: 512
+    depth: 12
+    num_timesteps: 1000
+    check_point_name: "DiT.image.256.pt"
+    max_train_timestep: 120
+    patch: 4
+
+  refiner_64:
+    use_latent: false
+    image_size: 64
+    raw_crop_size: 0
+    latent_image_size: 0
+    num_heads: 4
+    dim: 256
+    depth: 10
+    num_timesteps: 1000
+    check_point_name: "DiT.image.64.pt"
+    max_train_timestep: 120
+    patch: 4
+
+  refiner_32:
+    use_latent: false
+    image_size: 32
+    raw_crop_size: 0
+    latent_image_size: 0
+    num_heads: 4
+    dim: 256
+    depth: 10
+    num_timesteps: 1000
+    check_point_name: "DiT.image.32.pt"
+    max_train_timestep: 120
+    patch: 2

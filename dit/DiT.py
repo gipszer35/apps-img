@@ -10,13 +10,14 @@ import datetime
 import os, sys
 import matplotlib.pyplot as plt
 import torchvision.transforms as T
-from dataclasses import dataclass
+import dataclasses
 from timm.models.vision_transformer import Attention, Mlp
 from torch.optim.lr_scheduler import LambdaLR
 from ema_pytorch import EMA
 from diffusers import AutoencoderKL
 import random
 from PIL import Image
+import yaml
 
 
 class Environment:
@@ -68,7 +69,7 @@ class Environment:
 Environment()
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=False)
 class DiTConfig:
     # Environment paths generated automatically from the Environment Singleton
     work_dir: str
@@ -85,48 +86,71 @@ class DiTConfig:
     dim: int
     depth: int
     num_timesteps: int
+    max_train_timestep: int
     check_point_name: str
 
     # Static constants
     vae_model_name: str = "stabilityai/sd-vae-ft-ema"
     latent_scale: float = 0.18215
-    num_epochs = 10000
-    patch = 2
+    num_epochs: int = 10000
+    patch: int = 2
+    grayscale: bool = True
 
-    lr: float = 5e-4
+    lr: float = 1e-5
 
     @classmethod
     def create(cls, **kwargs) -> "DiTConfig":
-        """
-        Factory method that automatically extracts environment details from the
-        Environment Singleton and builds the frozen DiTConfig instance.
-        """
-        env = Environment()  # Safely access the Singleton instance
+        """Factory method that dynamically resolves defaults for ALL dataclass fields."""
 
-        # If batch_size is not explicitly passed in kwargs, set the smart default
-        if "batch_size" not in kwargs:
-            kwargs["batch_size"] = 8 if env.is_colab else 2
+        env = Environment()
 
-        return cls(
-            work_dir=env.work_dir,
-            images_dir=env.images_dir,
-            content_drive=env.content_drive,
-            **kwargs,  # Pass the rest of the explicit architecture arguments
+        # Inject the mandatory environment paths
+        kwargs.update(
+            {
+                "work_dir": env.work_dir,
+                "images_dir": env.images_dir,
+                "content_drive": env.content_drive,
+            }
         )
+
+        # Defaults that depend on runtime environment
+        kwargs.setdefault("batch_size", 256 if env.is_colab else 2)
+
+        # Dynamically loop through all defined fields in the class
+        for field in dataclasses.fields(cls):
+            if field.name not in kwargs and field.default is not dataclasses.MISSING:
+                kwargs[field.name] = field.default
+
+        # Dynamic fallback: if max_train_timestep wasn't specified, fall back to num_timesteps
+        if kwargs.get("max_train_timestep") is None:
+            kwargs["max_train_timestep"] = kwargs["num_timesteps"]
+
+        return cls(**kwargs)
+
+    @property
+    def out_dir(self):
+        return os.path.join(self.work_dir, "out_dir")
 
     @property
     def latent_image_dir(self) -> str:
-        return os.path.join(self.work_dir, "temp_dir_for_latents")
+        return os.path.join(self.out_dir, "temp_dir_for_latents")
 
     @property
     def dit_checkpoint_path(self) -> str:
-        return os.path.join(self.work_dir, self.check_point_name)
+        return os.path.join(self.out_dir, self.check_point_name)
+
+    @property
+    def cropped_images_path(self) -> str:
+        return os.path.join(self.out_dir, f"cropped_{self.image_size}.pt")
 
     @property
     def input_shape(self) -> tuple:
         if self.use_latent:
             return (4, self.latent_image_size, self.latent_image_size)
-        return (3, self.image_size, self.image_size)
+        elif self.grayscale:
+            return (1, self.image_size, self.image_size)
+        else:
+            return (3, self.image_size, self.image_size)
 
 
 class ImageManager:
@@ -192,7 +216,8 @@ class ImageManager:
             dataloader = DataLoader(dataset, batch_size=4, shuffle=False)
             counter = 0
             with ImageManager.VAEManager(self.config.vae_model_name) as vae:
-                for images, _ in dataloader:
+                for data in dataloader:
+                    images = data[0] if isinstance(data, (tuple, list)) else data
                     images = images.to(common.DEVICE, dtype=torch.float16)
                     with torch.inference_mode():
                         latents = (
@@ -207,6 +232,38 @@ class ImageManager:
                         counter += 1
 
             self.logger.info(f"Saved latents to {self.latent_dir}")
+
+    def cache_images_from_image_dataset(self):
+        cache_file = self.config.cropped_images_path
+        if os.path.exists(cache_file):
+            self.logger.info(
+                f"{cache_file} already exists. " "Skip to generate cached images"
+            )
+            return
+
+        self.logger.info("Creating cached images from dataset...")
+
+        dataset = image_utils.cropped_dataset(
+            self.config.images_dir,
+            crop_size=self.config.image_size,
+            max_num_patches_per_image=1,
+            grayscale=True,
+        )
+
+        images = []
+
+        for i in range(len(dataset)):
+            data = dataset[i]
+            image = data[0] if isinstance(data, (tuple, list)) else data
+
+            if not torch.is_tensor(image):
+                image = T.ToTensor()(image)
+
+            images.append(image)
+
+        images = torch.stack(images)
+        torch.save(images, cache_file)
+        self.logger.info(f"Saved {len(images)} images to {cache_file}")
 
     class LatentPatchDataset(Dataset):
         def __init__(self, latent_dir, crop_size=None):
@@ -233,38 +290,79 @@ class ImageManager:
 
             return latent
 
+    class CachedImageDataset(Dataset):
+        def __init__(self, images, transform=None):
+            self.images = images
+            self.transform = transform
+
+        def __len__(self):
+            return len(self.images)
+
+        def __getitem__(self, idx):
+            image = self.images[idx]
+            if self.transform is not None:
+                image = self.transform(image)
+            return image
+
     def get_dataloader(self):
         self.logger.info("Creating dataset and preparing dataloader...")
+
         if self.config.use_latent:
             self.cache_latents_from_image_dataset()
             dataset = ImageManager.LatentPatchDataset(
-                latent_dir=self.latent_dir, crop_size=self.config.latent_image_size
+                latent_dir=self.latent_dir,
+                crop_size=self.config.latent_image_size,
             )
+
         else:
-            dataset = image_utils.cropped_dataset(
-                self.config.images_dir,
-                crop_size=self.config.image_size,
-                max_num_patches_per_image=1,
+            self.cache_images_from_image_dataset()
+            cache_file = self.config.cropped_images_path
+            images = torch.load(
+                cache_file,
+                map_location="cpu",
+            )
+            dataset = ImageManager.CachedImageDataset(
+                images,
+                transform=image_utils.Random90Rotation(),
             )
         self.logger.info(
             f"Dataloader successfully initialized with {len(dataset)} samples."
         )
-        return DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
+
+        return DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+        )
 
     @staticmethod
     def _to_pil(img_tensor):
-        """Helper to convert a [C,H,W] tensor to a PIL Image."""
+        """Convert a [C,H,W] tensor to a PIL Image."""
+
         img = img_tensor.detach().cpu().float()
         img = img.clamp(0, 1)
-        img = img.permute(1, 2, 0).numpy()
-        img = (img * 255).astype("uint8")
-        return Image.fromarray(img)
+
+        # Grayscale: [1, H, W] -> [H, W]
+        if img.shape[0] == 1:
+            img = img.squeeze(0).numpy()
+            img = (img * 255).astype("uint8")
+            return Image.fromarray(img, mode="L")
+
+        # RGB: [3, H, W] -> [H, W, 3]
+        elif img.shape[0] == 3:
+            img = img.permute(1, 2, 0).numpy()
+            img = (img * 255).astype("uint8")
+            return Image.fromarray(img, mode="RGB")
+
+        else:
+            raise ValueError(f"Expected 1 or 3 channels, got shape {tuple(img.shape)}")
 
     @staticmethod
     def latent_to_image(config, vae, latent):
         latent = latent.unsqueeze(0).to(vae.device, dtype=torch.float16)
         with torch.no_grad():
             img = vae.decode(latent / config.latent_scale).sample
+            img = (img / 2 + 0.5).clamp(0, 1)
         return ImageManager._to_pil(img[0])
 
     @staticmethod
@@ -428,11 +526,91 @@ class DiffusionTransformer(nn.Module):
         return x
 
 
+class ImageGenerator:
+    def __init__(self, config: DiTConfig, ema_model, betas, alphas, get_alpha_bar_fn):
+        """
+        Handles inference tasks by reusing a centralized denoising loop.
+        """
+        self.config = config
+        self.ema = ema_model
+        self.betas = betas
+        self.alphas = alphas
+        self.get_alpha_bar = get_alpha_bar_fn
+
+    def _denoise_loop(
+        self, x_t: torch.Tensor, start_t: int, image_class=None
+    ) -> torch.Tensor:
+        """Centralized DDPM loop that denoises x_t from start_t down to 0."""
+        was_training = self.ema.training
+        self.ema.eval()
+        B = x_t.size(0)
+
+        with torch.inference_mode():
+            for t in reversed(range(start_t)):
+                t_tensor = torch.full((B,), t, device=common.DEVICE, dtype=torch.long)
+                pred_noise = self.ema(x_t, t_tensor, image_class=image_class)
+
+                alpha_t = self.alphas[t]
+                alpha_bar_t = self.get_alpha_bar(t)
+                beta_t = self.betas[t]
+
+                mean = (1 / torch.sqrt(alpha_t)) * (
+                    x_t - (beta_t / torch.sqrt(1 - alpha_bar_t)) * pred_noise
+                )
+
+                if t > 0:
+                    x_t = mean + torch.sqrt(beta_t) * torch.randn_like(x_t)
+                else:
+                    x_t = mean
+
+        if was_training:
+            self.ema.train()
+
+        x_t = x_t.squeeze(0).cpu()
+        return x_t
+
+    def from_pure_noise(self, image_class=None) -> torch.Tensor:
+        """Generates a completely new image starting from pure Gaussian noise."""
+        B = 1
+        C, H, W = self.config.input_shape
+        x_t = torch.randn(B, C, H, W, device=common.DEVICE)
+
+        # Denoise through the entire scheduled timeline
+        return self._denoise_loop(
+            x_t, start_t=self.config.num_timesteps, image_class=image_class
+        )
+
+    def refine_image(self, real: torch.Tensor, image_class=None) -> torch.Tensor:
+        """Injects noise up to max_train_timestep and refines it using the model."""
+        x0 = real.to(common.DEVICE)
+        if x0.dim() == 3:
+            x0 = x0.unsqueeze(0)
+        B = x0.size(0)
+
+        start_t = self.config.max_train_timestep - 1
+        t_tensor = torch.full((B,), start_t, device=common.DEVICE, dtype=torch.long)
+
+        # Add controlled diffusion noise
+        noise = torch.randn_like(x0)
+        a_bar = self.get_alpha_bar(t_tensor)
+        x_t = torch.sqrt(a_bar) * x0 + torch.sqrt(1 - a_bar) * noise
+
+        # Denoise only from the restricted maximum timestep down to 0
+        return self._denoise_loop(
+            x_t, start_t=self.config.max_train_timestep, image_class=image_class
+        )
+
+
 class DiffusionTrainer:
 
     def __init__(self, logger, config: DiTConfig):
         self.config = config
         self.logger = logger
+
+        if not os.path.exists(self.config.out_dir):
+            self.logger.info(f"Creating output directory: {self.config.out_dir}")
+            os.makedirs(self.config.out_dir, exist_ok=True)
+
         self.dataloader = ImageManager(config, logger).get_dataloader()
 
         self.num_epochs = config.num_epochs
@@ -445,6 +623,25 @@ class DiffusionTrainer:
         self.load_or_init()
         self.logger.info(f"Batch size: {config.batch_size}")
         self.logger.info(f"LR: {config.lr}")
+        self.image_generator = ImageGenerator(
+            config, self.ema.ema_model, self.betas, self.alphas, self.get_alpha_bar
+        )
+
+    @classmethod
+    def from_yaml(cls, profile_name: str, logger, config_path: str = "config.yaml"):
+        """Factory method to instantiate the trainer using a YAML profile."""
+
+        # If the path is relative, look for it inside the environment's work directory
+        if not os.path.isabs(config_path):
+            env = Environment()
+            config_path = os.path.join(env.work_dir, config_path)
+
+        with open(config_path, "r") as f:
+            full_config = yaml.safe_load(f)
+
+        profile_dict = full_config["trainers"][profile_name]
+        config = DiTConfig.create(**profile_dict)
+        return cls(logger=logger, config=config)
 
     def predict_x0(self, x_t, pred_noise, t):
         a_bar = self.get_alpha_bar(t)
@@ -470,7 +667,7 @@ class DiffusionTrainer:
             return 0.01 + 0.99 * (current_step / warmup_steps)  # linear warmup
         return 1.0
 
-    def debug_diffusion(self, real, x_t, x0_pred, ema_cleared, from_pure_noise):
+    def debug_diffusion(self, real, x_t, x0_pred, ema_cleared, generated):
         def normalize(x):
             x_min = x.min()
             x_max = x.max()
@@ -494,7 +691,10 @@ class DiffusionTrainer:
                 else:
                     pil_img = ImageManager.tensor_to_image(img)
 
-                ax.imshow(pil_img)
+                if pil_img.mode == "L":
+                    ax.imshow(pil_img, cmap="gray", vmin=0, vmax=255)
+                else:
+                    ax.imshow(pil_img)
                 ax.set_title(title)
                 ax.axis("off")
 
@@ -509,8 +709,8 @@ class DiffusionTrainer:
         plt.show()
 
         # Full-size result
-        _, ax = plt.subplots(figsize=(8, 8))
-        visualizer.show(ax, from_pure_noise, "From pure noise")
+        _, ax = plt.subplots(figsize=(6, 6))
+        visualizer.show(ax, generated, "Generated")
         plt.show()
 
     def log_info(self, epoch, loss, ema_loss):
@@ -523,6 +723,21 @@ class DiffusionTrainer:
         self.logger.info(f"Avg student loss: {avg_loss:.4f}")
         self.logger.info(f"Avg master (Ema) loss: {avg_ema_loss:.4f}")
 
+    def generate_samples(self, real, image_class=None):
+        """
+        Dynamically generates or refines images based on the max_train_timestep configuration.
+        """
+        now = datetime.datetime.now()
+
+        if self.config.max_train_timestep == self.config.num_timesteps:
+            self.logger.info(f"Start generating from pure noise. {now}")
+            return self.image_generator.from_pure_noise(image_class=image_class)
+        else:
+            self.logger.info(
+                f"Start refining image from timestep {self.config.max_train_timestep}. {now}"
+            )
+            return self.image_generator.refine_image(real, image_class=image_class)
+
     def show_training_state(
         self, loss, ema_loss, real, x_t, pred_noise, ema_pred_noise, epoch, t
     ):
@@ -533,57 +748,22 @@ class DiffusionTrainer:
 
         x0_pred = self.predict_x0(x_t, pred_noise, t)
         ema_x0_pred = self.predict_x0(x_t, ema_pred_noise, t)
-        self.logger.info(f"Start generating from pure noise. {datetime.datetime.now()}")
-        from_pure_noise = self.generate_image_from_pure_noise()
+        generated = self.generate_samples(real)
+
         self.logger.info(
             f"Finished generating from pure noise. {datetime.datetime.now()}"
         )
-        self.debug_diffusion(real, x_t, x0_pred, ema_x0_pred, from_pure_noise)
+        self.debug_diffusion(real, x_t, x0_pred, ema_x0_pred, generated)
 
     def get_alpha_bar(self, t):
         return self.alpha_bar[t].view(-1, 1, 1, 1)
 
-    def generate_image_from_pure_noise(self, image_class=None):
-        was_training = self.ema.training
-        self.ema.eval()
-
-        B = 1
-        C, H, W = self.config.input_shape
-        x_t = torch.randn(B, C, H, W, device=common.DEVICE)
-
-        with torch.inference_mode():
-            for t in reversed(range(self.num_timesteps)):
-                t_tensor = torch.full((B,), t, device=common.DEVICE, dtype=torch.long)
-
-                # predict noise
-                pred_noise = self.ema(x_t, t_tensor, image_class=image_class)
-
-                alpha_t = self.alphas[t]
-                alpha_bar_t = self.get_alpha_bar(t)
-                beta_t = self.betas[t]
-
-                # DDPM posterior mean
-                mean = (
-                    1
-                    / torch.sqrt(alpha_t)
-                    * (x_t - (beta_t / torch.sqrt(1 - alpha_bar_t)) * pred_noise)
-                )
-
-                if t > 0:
-                    noise = torch.randn_like(x_t)
-                    sigma = torch.sqrt(beta_t)
-                    x_t = mean + sigma * noise
-                else:
-                    x_t = mean
-        if was_training:
-            self.ema.train()
-
-        return x_t.squeeze().cpu()
-
     def train_step(self, real, epoch):
         x0 = real.to(common.DEVICE)
 
-        t = torch.randint(0, self.num_timesteps, (x0.size(0),), device=common.DEVICE)
+        t = torch.randint(
+            0, self.config.max_train_timestep, (x0.size(0),), device=common.DEVICE
+        )
 
         noise = torch.randn_like(x0)
         a_bar = self.get_alpha_bar(t)
@@ -599,7 +779,7 @@ class DiffusionTrainer:
             self.optimizer.zero_grad()
             self.scheduler.step()
             self.ema.update()
-        if self.step % (accumulation_steps * 3) == 0:
+        if self.step % (accumulation_steps * 48) == 0:
             with torch.no_grad():
                 self.save_checkpoint()
                 ema_pred_noise = self.ema.ema_model(x_t, t)
@@ -623,6 +803,7 @@ class DiffusionTrainer:
             for real in self.dataloader:
                 # Extract the raw tensor if wrapped in a list, otherwise keep it as-is
                 real = real[0] if isinstance(real, (tuple, list)) else real
+                real = real.to(common.DEVICE, dtype=torch.float32)
                 self.train_step(real, epoch)
 
     def save_checkpoint(self):
@@ -676,60 +857,10 @@ class DiffusionTrainer:
         common.print_parameter_summary(self.model)
 
 
-class PixelTrainer(DiffusionTrainer):
-    def __init__(self, logger, config: DiTConfig = None):
-        if config is None:
-            config = DiTConfig.create(
-                use_latent=False,
-                image_size=64,
-                raw_crop_size=0,
-                latent_image_size=0,
-                num_heads=8,
-                dim=256,
-                depth=8,
-                num_timesteps=1000,
-                check_point_name="DiT.vae.image.pt",
-            )
-        super().__init__(logger, config=config)
-
-
-class LatentTrainer(DiffusionTrainer):
-    def __init__(self, logger, config: DiTConfig = None):
-        if config is None:
-            config = DiTConfig.create(
-                use_latent=True,
-                image_size=0,
-                raw_crop_size=512,
-                latent_image_size=32,
-                num_heads=8,
-                dim=512,
-                depth=10,
-                num_timesteps=600,
-                check_point_name="DiT.vae.pt",
-            )
-        super().__init__(logger, config=config)
-
-
-class LargeLatentTrainer(DiffusionTrainer):
-    def __init__(self, logger, config: DiTConfig = None):
-        if config is None:
-            config = DiTConfig.create(
-                use_latent=True,
-                image_size=0,
-                raw_crop_size=512 + 256 + 128,
-                latent_image_size=96,
-                num_heads=8,
-                dim=512,
-                depth=10,
-                num_timesteps=600,
-                check_point_name="DiT.vae.768.pt",
-            )
-        super().__init__(logger, config=config)
-
-
 def train():
     logger = common.create_logger()
-    trainer = PixelTrainer(logger)
+    # Initialize the specific model setup directly via the factory classmethod
+    trainer = DiffusionTrainer.from_yaml(profile_name="refiner_32", logger=logger)
     trainer.train()
 
 
