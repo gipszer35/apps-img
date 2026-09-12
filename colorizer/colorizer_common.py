@@ -15,14 +15,6 @@ logger = common.create_logger()
 class DataLoaderFactory:
     """Factory class to load and augment dataset, then return a configured DataLoader."""
 
-    class Random90Rotation:
-        """Custom transform to rotate images into one of the 4 cardinal directions (0, 90, 180, 270 degrees)."""
-
-        def __call__(self, img):
-            # Randomly choose to rotate 0, 1, 2, or 3 times by 90 degrees
-            k = random.choice([0, 1, 2, 3])
-            return T.functional.rotate(img, k * 90)
-
     def __init__(self, config, dataset):
         self.config = config
         self.dataset = dataset
@@ -35,7 +27,7 @@ class DataLoaderFactory:
                         T.ToPILImage()(img) if isinstance(img, np.ndarray) else img
                     )
                 ),
-                DataLoaderFactory.Random90Rotation(),
+                image_utils.Random90Rotation(),
                 T.ColorJitter(
                     brightness=0.15,
                     contrast=0.15,
