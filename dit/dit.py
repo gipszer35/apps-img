@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import datetime
 import os, sys
 import matplotlib.pyplot as plt
@@ -39,13 +39,12 @@ class Environment:
             self._mount_colab()
             self.root_dir = os.path.join(self.content_drive, "MyDrive")
             self.apps_img = os.path.join(self.root_dir, "apps-img")
-            self.work_dir = os.path.join(self.apps_img, "dit")
             self.images_dir = os.path.join(self.root_dir, "images")
         else:
-            self.root_dir = "../"
-            self.apps_img = self.root_dir
-            self.work_dir = "./"
-            self.images_dir = "../images/my-images/"
+            self.root_dir = os.path.expanduser("~/work")
+            self.apps_img = os.path.join(self.root_dir, "apps-img")
+            self.images_dir = os.path.join(self.apps_img, "images", "my-images")
+        self.work_dir = os.path.join(self.apps_img, "dit")
 
         # Update sys.path so Python knows where to look for imports
         sys.path.extend([self.root_dir, self.apps_img, self.work_dir])
@@ -96,7 +95,7 @@ class DiTConfig:
     patch: int = 2
     grayscale: bool = True
 
-    lr: float = 5e-5
+    lr: float = 1e-4
 
     @classmethod
     def create(cls, **kwargs) -> "DiTConfig":
@@ -114,7 +113,7 @@ class DiTConfig:
         )
 
         # Defaults that depend on runtime environment
-        kwargs.setdefault("batch_size", 256 if env.is_colab else 2)
+        kwargs.setdefault("batch_size", 96 if env.is_colab else 2)
 
         # Dynamically loop through all defined fields in the class
         for field in dataclasses.fields(cls):
@@ -151,223 +150,6 @@ class DiTConfig:
             return (1, self.image_size, self.image_size)
         else:
             return (3, self.image_size, self.image_size)
-
-
-class ImageManager:
-    """
-    Manages image and latent conversions, caching, and visualization
-    for the model, optimizing GPU memory by offloading the VAE.
-    """
-
-    def __init__(self, config, logger):
-        self.config = config
-        self.logger = logger
-        self.latent_dir = self.config.latent_image_dir
-        self.transform = transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(p=0.5),
-                # Mild color change (5%)
-                transforms.ColorJitter(
-                    brightness=0.1, contrast=0.1, saturation=0.1, hue=0.003
-                ),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-            ]
-        )
-
-    class VAEManager:
-        def __init__(self, model_name):
-            self.model_name = model_name
-            self.vae = None
-
-        def create_vae(self):
-            """Create a VAE and keep it in GPU memory until program ends."""
-            if self.vae is None:
-                self.vae = AutoencoderKL.from_pretrained(
-                    self.model_name, torch_dtype=torch.float16
-                ).to(common.DEVICE)
-                self.vae.eval()
-            return self.vae
-
-        def __enter__(self):
-            """Context manager entry — create VAE if not already created."""
-            return self.create_vae()
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            """Context manager exit — delete VAE to free GPU."""
-            if self.vae is not None:
-                del self.vae
-                self.vae = None
-                torch.cuda.empty_cache()
-
-    def cache_latents_from_image_dataset(self):
-        if os.path.exists(self.latent_dir):
-            self.logger.info(
-                f"{self.latent_dir} directory already exists. Skip to generate latent files"
-            )
-        else:
-            self.logger.info("Creating latents from dataset...")
-            dataset = image_utils.cropped_dataset(
-                self.config.images_dir,
-                crop_size=self.config.raw_crop_size,
-                max_num_patches_per_image=1,
-                transform=self.transform,
-            )
-            os.makedirs(self.latent_dir)
-            dataloader = DataLoader(dataset, batch_size=4, shuffle=False)
-            counter = 0
-            with ImageManager.VAEManager(self.config.vae_model_name) as vae:
-                for data in dataloader:
-                    images = data[0] if isinstance(data, (tuple, list)) else data
-                    images = images.to(common.DEVICE, dtype=torch.float16)
-                    with torch.inference_mode():
-                        latents = (
-                            vae.encode(images).latent_dist.mode()
-                            * self.config.latent_scale
-                        )
-                    # Save each latent separately
-                    for latent in latents:
-                        torch.save(
-                            latent.cpu(), f"{self.latent_dir}/latent_{counter}.pt"
-                        )
-                        counter += 1
-
-            self.logger.info(f"Saved latents to {self.latent_dir}")
-
-    def cache_images_from_image_dataset(self):
-        cache_file = self.config.cropped_images_path
-        if os.path.exists(cache_file):
-            self.logger.info(
-                f"{cache_file} already exists. " "Skip to generate cached images"
-            )
-            return
-
-        self.logger.info("Creating cached images from dataset...")
-
-        dataset = image_utils.cropped_dataset(
-            self.config.images_dir,
-            crop_size=self.config.image_size,
-            max_num_patches_per_image=1,
-            grayscale=True,
-        )
-
-        images = []
-
-        for i in range(len(dataset)):
-            data = dataset[i]
-            image = data[0] if isinstance(data, (tuple, list)) else data
-
-            if not torch.is_tensor(image):
-                image = T.ToTensor()(image)
-
-            images.append(image)
-
-        images = torch.stack(images)
-        torch.save(images, cache_file)
-        self.logger.info(f"Saved {len(images)} images to {cache_file}")
-
-    class LatentPatchDataset(Dataset):
-        def __init__(self, latent_dir, crop_size=None):
-            self.files = [
-                os.path.join(latent_dir, f)
-                for f in os.listdir(latent_dir)
-                if f.endswith(".pt")
-            ]
-            self.crop_size = crop_size
-
-        def __len__(self):
-            return len(self.files)
-
-        def __getitem__(self, idx):
-            latent = torch.load(self.files[idx])
-
-            if self.crop_size:
-                C, H, W = latent.shape
-                top = random.randint(0, H - self.crop_size)
-                left = random.randint(0, W - self.crop_size)
-                latent = latent[
-                    :, top : top + self.crop_size, left : left + self.crop_size
-                ]
-
-            return latent
-
-    class CachedImageDataset(Dataset):
-        def __init__(self, images, transform=None):
-            self.images = images
-            self.transform = transform
-
-        def __len__(self):
-            return len(self.images)
-
-        def __getitem__(self, idx):
-            image = self.images[idx]
-            if self.transform is not None:
-                image = self.transform(image)
-            return image
-
-    def get_dataloader(self):
-        self.logger.info("Creating dataset and preparing dataloader...")
-
-        if self.config.use_latent:
-            self.cache_latents_from_image_dataset()
-            dataset = ImageManager.LatentPatchDataset(
-                latent_dir=self.latent_dir,
-                crop_size=self.config.latent_image_size,
-            )
-
-        else:
-            self.cache_images_from_image_dataset()
-            cache_file = self.config.cropped_images_path
-            images = torch.load(
-                cache_file,
-                map_location="cpu",
-            )
-            dataset = ImageManager.CachedImageDataset(
-                images,
-                transform=image_utils.Random90Rotation(),
-            )
-        self.logger.info(
-            f"Dataloader successfully initialized with {len(dataset)} samples."
-        )
-
-        return DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-        )
-
-    @staticmethod
-    def _to_pil(img_tensor):
-        """Convert a [C,H,W] tensor to a PIL Image."""
-
-        img = img_tensor.detach().cpu().float()
-        img = img.clamp(0, 1)
-
-        # Grayscale: [1, H, W] -> [H, W]
-        if img.shape[0] == 1:
-            img = img.squeeze(0).numpy()
-            img = (img * 255).astype("uint8")
-            return Image.fromarray(img, mode="L")
-
-        # RGB: [3, H, W] -> [H, W, 3]
-        elif img.shape[0] == 3:
-            img = img.permute(1, 2, 0).numpy()
-            img = (img * 255).astype("uint8")
-            return Image.fromarray(img, mode="RGB")
-
-        else:
-            raise ValueError(f"Expected 1 or 3 channels, got shape {tuple(img.shape)}")
-
-    @staticmethod
-    def latent_to_image(config, vae, latent):
-        latent = latent.unsqueeze(0).to(vae.device, dtype=torch.float16)
-        with torch.no_grad():
-            img = vae.decode(latent / config.latent_scale).sample
-            img = (img / 2 + 0.5).clamp(0, 1)
-        return ImageManager._to_pil(img[0])
-
-    @staticmethod
-    def tensor_to_image(img_tensor):
-        return ImageManager._to_pil(img_tensor)
 
 
 class TimestepEmbedder(nn.Module):
@@ -611,7 +393,8 @@ class DiffusionTrainer:
             self.logger.info(f"Creating output directory: {self.config.out_dir}")
             os.makedirs(self.config.out_dir, exist_ok=True)
 
-        self.dataloader = ImageManager(config, logger).get_dataloader()
+        self.image_manager = image_utils.ImageManager(logger, config.images_dir)
+        self.dataloader = self.get_dataloader()
 
         self.num_epochs = config.num_epochs
         self.checkpoint_path = config.dit_checkpoint_path
@@ -641,7 +424,48 @@ class DiffusionTrainer:
 
         profile_dict = full_config["trainers"][profile_name]
         config = DiTConfig.create(**profile_dict)
+        for key, value in vars(config).items():
+            logger.info("Config: %s = %s", key, value)
         return cls(logger=logger, config=config)
+
+    def get_dataloader(self):
+        self.logger.info("Creating dataset and preparing dataloader...")
+        latent_dir = self.config.latent_image_dir
+
+        if self.config.use_latent:
+            self.image_manager.cache_latents_from_image_dataset(
+                latent_dir,
+                self.config.raw_crop_size,
+                self.config.vae_model_name,
+                self.config.latent_scale,
+            )
+            dataset = image_utils.ImageManager.LatentPatchDataset(
+                latent_dir=latent_dir,
+                crop_size=self.config.latent_image_size,
+            )
+        else:
+            self.image_manager.cache_images_from_image_dataset(
+                self.config.cropped_images_path,
+                self.config.image_size
+            )
+            cache_file = self.config.cropped_images_path
+            images = torch.load(
+                cache_file,
+                map_location="cpu",
+            )
+            dataset = image_utils.ImageManager.CachedImageDataset(
+                images,
+                transform=image_utils.Random90Rotation(),
+            )
+        self.logger.info(
+            f"Dataloader successfully initialized with {len(dataset)} samples."
+        )
+
+        return DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+        )
 
     def predict_x0(self, x_t, pred_noise, t):
         a_bar = self.get_alpha_bar(t)
@@ -678,7 +502,7 @@ class DiffusionTrainer:
         class Visualizer:
             def __init__(self, config):
                 self.config = config
-                self.vae = ImageManager.VAEManager(
+                self.vae = image_utils.ImageManager.VAEManager(
                     self.config.vae_model_name
                 ).create_vae()
 
@@ -687,9 +511,11 @@ class DiffusionTrainer:
                     img = img.detach().cpu()
 
                 if self.config.use_latent:
-                    pil_img = ImageManager.latent_to_image(self.config, self.vae, img)
+                    pil_img = image_utils.ImageManager.latent_to_image(
+                        self.config.latent_scale, self.vae, img
+                    )
                 else:
-                    pil_img = ImageManager.tensor_to_image(img)
+                    pil_img = image_utils.ImageManager.tensor_to_image(img)
 
                 if pil_img.mode == "L":
                     ax.imshow(pil_img, cmap="gray", vmin=0, vmax=255)
@@ -709,7 +535,7 @@ class DiffusionTrainer:
         plt.show()
 
         # Full-size result
-        _, ax = plt.subplots(figsize=(6, 6))
+        _, ax = plt.subplots(figsize=(4, 4))
         visualizer.show(ax, generated, "Generated")
         plt.show()
 
@@ -860,7 +686,7 @@ class DiffusionTrainer:
 def train():
     logger = common.create_logger()
     # Initialize the specific model setup directly via the factory classmethod
-    trainer = DiffusionTrainer.from_yaml(profile_name="refiner_32", logger=logger)
+    trainer = DiffusionTrainer.from_yaml(profile_name="refiner_32_large", logger=logger)
     trainer.train()
 
 

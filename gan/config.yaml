@@ -1,0 +1,7 @@
+trainers:
+  gan_small:
+    image_size: 32
+    num_channel: 3
+    beta: 0.5
+    epoch: 5000
+

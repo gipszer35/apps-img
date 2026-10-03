@@ -61,3 +61,15 @@ trainers:
     check_point_name: "DiT.image.32.pt"
     max_train_timestep: 60
     patch: 2
+
+  refiner_32_large:
+      use_latent: false
+      image_size: 32
+      raw_crop_size: 0
+      latent_image_size: 0
+      num_heads: 8
+      dim: 512
+      depth: 12
+      num_timesteps: 1000
+      check_point_name: "DiT.image.32.large.pt"
+      patch: 2

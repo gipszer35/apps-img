@@ -1,0 +1,16 @@
+# PyTorch model weights
+*.pt
+
+# Jupyter notebooks
+*.ipynb
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Training data
+data/
+images/
+
+# Old files
+/OLD/
