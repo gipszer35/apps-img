@@ -1,0 +1,29 @@
+trainers:
+  vae_small:
+    # Dataset
+    dataset_dirs:
+      - /path/to/img_align_celeba_small
+      - /path/to/tiny-imagenet-200-small
+
+    train_ratio: 0.97
+    seed: 42
+
+    # Training
+    epoch: 100
+    batch_size: 128
+    lr: 0.001
+    num_workers: 2
+
+    # Model
+    num_channel: 3
+    latent_dim: 128
+    image_height: 40
+    image_width: 32
+
+    # Checkpoint
+    checkpoint_name: vae_latest.pt
+
+    # Logging and visualization
+    log_interval: 20
+    num_visualize: 5
+    show_images: true

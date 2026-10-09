@@ -212,18 +212,29 @@ def cropped_dataset(
     return TensorDataset(cropped_tensor)
 
 
-def cifar100_dataset(root="./data"):
-    cifar_dataset = datasets.CIFAR100(
-        root=root, download=True, transform=normalize_transform()
+def cifar_dataset(dataset_name="CIFAR100", root="./data"):
+    def cifar_transform():
+        return transforms.Compose([transforms.ToTensor(), normalize_transform()])
+
+    dataset_classes = {
+        "CIFAR10": datasets.CIFAR10,
+        "CIFAR100": datasets.CIFAR100,
+    }
+
+    if dataset_name not in dataset_classes:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+    return dataset_classes[dataset_name](
+        root=root, download=True, transform=cifar_transform()
     )
-    return cifar_dataset
+
+
+def cifar100_dataset(root="./data"):
+    return cifar_dataset("CIFAR100", root)
 
 
 def cifar10_dataset(root="./data"):
-    cifar_dataset = datasets.CIFAR10(
-        root=root, download=True, transform=normalize_transform()
-    )
-    return cifar_dataset
+    return cifar_dataset("CIFAR10", root)
 
 
 def mixed_dataloader(datasets, batch_size):
@@ -253,7 +264,7 @@ def show_image_eval(image_type, images, loss):
     else:
         cmap = None
 
-    img = img.detach().numpy()
+    img = img.detach().cpu().numpy()
     plt.imshow(img, cmap=cmap)
     plt.title(f"p={p:.2f}: loss={loss:.3f}")
     plt.axis("off")

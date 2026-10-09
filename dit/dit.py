@@ -86,7 +86,7 @@ class DiTConfig:
     depth: int
     num_timesteps: int
     max_train_timestep: int
-    check_point_name: str
+    checkpoint_name: str
 
     # Static constants
     vae_model_name: str = "stabilityai/sd-vae-ft-ema"
@@ -136,7 +136,7 @@ class DiTConfig:
 
     @property
     def dit_checkpoint_path(self) -> str:
-        return os.path.join(self.out_dir, self.check_point_name)
+        return os.path.join(self.out_dir, self.checkpoint_name)
 
     @property
     def cropped_images_path(self) -> str:
@@ -530,7 +530,6 @@ class DiffusionTrainer:
         visualizer.show(axes[1], x_t, "Noised")
         visualizer.show(axes[2], x0_pred, "Cleaned")
         visualizer.show(axes[3], ema_cleared, "Ema Cleaned")
-
         plt.tight_layout()
         plt.show()
 

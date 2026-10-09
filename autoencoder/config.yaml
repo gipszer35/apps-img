@@ -1,0 +1,26 @@
+trainers:
+  autoencoder_small:
+    # Training
+    epoch: 10000
+    lr: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    batch_size: 4
+    num_workers: 2
+
+    # Images
+    num_channel: 3
+    image_size: 256
+    lr_image_size: 32
+    crop_image_size: 276
+    num_patches_per_image: 5
+
+    # Loss
+    perceptual_weight: 0.1
+
+    # Checkpoint
+    checkpoint_name: autoencoder.pt
+
+    # Logging
+    log_interval: 50
+    show_images: true

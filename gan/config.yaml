@@ -1,7 +1,10 @@
 trainers:
   gan_small:
     image_size: 32
+    latent_vector_size: 150
     num_channel: 3
     beta: 0.5
     epoch: 5000
+    checkpoint_name: "gan_small.pt"
+
 

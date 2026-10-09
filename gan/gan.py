@@ -34,9 +34,7 @@ class Environment:
         else:
             self.root_dir = os.path.expanduser("~/work")
             self.apps_img = os.path.join(self.root_dir, "apps-img")
-            self.images_dir = os.path.join(
-                self.apps_img, "images", "my-images"
-            )
+            self.images_dir = os.path.join(self.apps_img, "images", "my-images")
         self.work_dir = os.path.join(self.apps_img, "gan")
 
         # Update sys.path so Python knows where to look for imports
@@ -71,15 +69,15 @@ class GanConfig:
     num_channel: int
     beta: float
     epoch: int
-    check_point_name: str
+    checkpoint_name: str
 
     # Explicit architecture and training hyperparameters
     image_size: int
     latent_vector_size: int
 
     # Static constants
-    lr_generator: float = 5e-4
-    lr_discriminator: float = 5e-4
+    lr_generator: float = 1e-4
+    lr_discriminator: float = 1e-4
 
     @classmethod
     def create(cls, **kwargs) -> "GanConfig":
@@ -96,7 +94,7 @@ class GanConfig:
             }
         )
 
-        kwargs.setdefault("batch_size", 128 if env.is_colab else 2)
+        kwargs.setdefault("batch_size", 2048 if env.is_colab else 2)
 
         # Dynamically loop through all defined fields in the class
         for field in dataclasses.fields(cls):
@@ -111,7 +109,11 @@ class GanConfig:
 
     @property
     def checkpoint_path(self) -> str:
-        return os.path.join(self.out_dir, self.check_point_name)
+        return os.path.join(self.out_dir, self.checkpoint_name)
+
+    @property
+    def cropped_images_path(self) -> str:
+        return os.path.join(self.out_dir, f"cropped_{self.image_size}.pt")
 
 
 class Generator(nn.Module):
@@ -159,37 +161,41 @@ class Discriminator(nn.Module):
     def __init__(self, config, base=256):
         super().__init__()
 
-        def block(in_c, out_c, kernel_size=3):
-            groups = min(64, out_c)
+        def block(in_c, out_c):
             return nn.Sequential(
-                nn.Conv2d(in_c, out_c, kernel_size=kernel_size, stride=2, padding=1),
+                nn.Conv2d(
+                    in_c,
+                    out_c,
+                    kernel_size=4,
+                    stride=2,
+                    padding=1,
+                ),
                 common.GaussianNoise(0.1),
-                nn.GroupNorm(groups, out_c),
+                nn.GroupNorm(32, out_c),
                 nn.LeakyReLU(0.2, inplace=True),
             )
 
         self.blocks = nn.Sequential(
-            block(config.num_channel, base // 4),  # 32 → 16
-            block(base // 4, base // 2),  # 16 → 8
-            block(base // 2, base),  # 8 → 4
-            block(base, base, 2),  # 4 → 2
-            block(base, base, kernel_size=2, stride=2, padding=0)
+            block(config.num_channel, base // 4),  # 32 -> 16
+            block(base // 4, base // 2),  # 16 -> 8
+            block(base // 2, base),  # 8 -> 4
+            block(base, base * 2),  # 4 -> 2
         )
 
-        self.final = nn.Sequential(
-            nn.Conv2d(base, 1, kernel_size=2, stride=1, padding=0),
-        )
+        self.final = nn.Conv2d(base * 2, 1, kernel_size=2)  # 2 -> 1
 
     def forward(self, x):
         x = self.blocks(x)
-        x = self.final(x)  # shape: [B, 1, 1, 1]
-        return x.view(-1)  # shape: [B]
+        x = self.final(x)
+        return x.view(x.size(0))
 
 
 class GanTrainer:
     def __init__(self, logger, config: GanConfig):
         self.logger = logger
         self.config = config
+        self.multi_loss_tracker = common.MultiLossTracker()
+
         if not os.path.exists(self.config.out_dir):
             self.logger.info(f"Creating output directory: {self.config.out_dir}")
             os.makedirs(self.config.out_dir, exist_ok=True)
@@ -207,7 +213,9 @@ class GanTrainer:
             full_config = yaml.safe_load(f)
 
         profile_dict = full_config["trainers"][profile_name]
-        config = DiTConfig.create(**profile_dict)
+        config = GanConfig.create(**profile_dict)
+        for key, value in vars(config).items():
+            logger.info("Config: %s = %s", key, value)
         return cls(logger=logger, config=config)
 
     @staticmethod
@@ -232,10 +240,56 @@ class GanTrainer:
         else:
             print(f"No checkpoint found at {path}, skipping load.")
 
-    def train():
+    def prepare_dataloader(self):
+        self.logger.info("Preparing datasets and dataloader")
+
+        cifar_cache_path = os.path.join(self.config.out_dir, "cifar100_dataset.pt")
+
+        if os.path.exists(cifar_cache_path):
+            self.logger.info(f"Loading CIFAR100 dataset from cache: {cifar_cache_path}")
+            cifar_dataset = torch.load(cifar_cache_path, weights_only=False)
+        else:
+            self.logger.info("CIFAR100 dataset not found in cache, creating new...")
+            cifar_dataset = image_utils.cifar100_dataset()
+
+            torch.save(cifar_dataset, cifar_cache_path)
+            self.logger.info(f"Saved CIFAR100 dataset to: {cifar_cache_path}")
+
+        datasets = [
+            cifar_dataset,
+            # image_utils.cropped_dataset(self.config.images_dir, 32),
+        ]
+
+        dataloader = image_utils.mixed_dataloader(
+            datasets,
+            self.config.batch_size,
+        )
+        self.logger.info(
+            f"Dataloader preparation finished: "
+            f"{len(dataloader)} batches, "
+            f"batch_size={self.config.batch_size}"
+        )
+        return dataloader
+
+    def print_losses(self, loss_d, loss_real, loss_fake, loss_g):
+
+        avg_loss_d = self.multi_loss_tracker.calculate_loss("loss_d", loss_d)
+        avg_loss_real = self.multi_loss_tracker.calculate_loss("loss_real", loss_real)
+        avg_loss_fake = self.multi_loss_tracker.calculate_loss("loss_fake", loss_fake)
+        avg_loss_g = self.multi_loss_tracker.calculate_loss("loss_g", loss_g)
+
+        self.logger.info(
+            f"D Loss: {loss_d.item():.4f} (avg: {avg_loss_d:.4f}) | "
+            f"Real: {loss_real.item():.4f} (avg: {avg_loss_real:.4f}) | "
+            f"Fake: {loss_fake.item():.4f} (avg: {avg_loss_fake:.4f})"
+        )
+
+        self.logger.info(f"G Loss: {loss_g.item():.4f} (avg: {avg_loss_g:.4f})")
+
+    def train(self):
         generator = Generator(self.config).to(common.DEVICE)
         discriminator = Discriminator(self.config).to(common.DEVICE)
-        criterion = nn.BCELoss()
+        criterion = nn.BCEWithLogitsLoss()
         optimizerD = optim.Adam(
             discriminator.parameters(),
             lr=self.config.lr_discriminator,
@@ -246,13 +300,15 @@ class GanTrainer:
             lr=self.config.lr_generator,
             betas=(self.config.beta, 0.999),
         )
-        datasets = [image_utils.cifar100_dataset(), image_utils.cropped_dataset(self.config.images_dir, 32)]
-        #datasets = [image_utils.cropped_dataset(self.config.images_dir, 32)]
 
-        dataloader = image_utils.mixed_dataloader(datasets, self.config.batch_size)
+        dataloader = self.prepare_dataloader()
 
         GanTrainer.load_gan_checkpoint_if_exists(
-            generator, optimizerG, discriminator, optimizerD, config.checkpoint_path
+            generator,
+            optimizerG,
+            discriminator,
+            optimizerD,
+            self.config.checkpoint_path,
         )
         logger.info("Generator")
         common.print_parameter_summary(generator)
@@ -269,40 +325,45 @@ class GanTrainer:
                 real_labels = torch.ones(batch_size, device=common.DEVICE)
                 fake_labels = torch.zeros(batch_size, device=common.DEVICE)
 
-                #  Train Discriminator
-                discriminator.zero_grad()
+                # Train Discriminator
+                optimizerD.zero_grad(set_to_none=True)
 
                 out_real = discriminator(real)
                 loss_real = criterion(out_real, real_labels)
-                loss_real.backward()
 
                 noise = torch.randn(
-                    batch_size, self.config.latent_vector_size, device=common.DEVICE
+                    batch_size,
+                    self.config.latent_vector_size,
+                    device=common.DEVICE,
                 )
                 fake = generator(noise)
 
                 out_fake = discriminator(fake.detach())
                 loss_fake = criterion(out_fake, fake_labels)
-                loss_fake.backward()
 
+                loss_d = loss_real + loss_fake
+                loss_d.backward()
                 optimizerD.step()
 
-                #  Train Generator
-                generator.zero_grad()
+                # Train Generator
+                optimizerG.zero_grad(set_to_none=True)
 
                 out = discriminator(fake)
                 loss_g = criterion(out, real_labels)
                 loss_g.backward()
-
                 optimizerG.step()
 
-                if i % 20 == 0:
-                    now = datetime.datetime.now()
-                    print("Current date and time:", now.strftime("%Y-%m-%d %H:%M:%S"))
-                    print(
-                        f"Epoch [{epoch+1}/{self.config.epoch}] Step [{i}/{len(dataloader)}] "
+                if i % 500 == 0:
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    self.logger.info(
+                        f"Time: {now} | "
+                        f"Epoch [{epoch + 1}/{self.config.epoch}] | "
+                        f"Step [{i}/{len(dataloader)}]"
                     )
-                    print(f"D Loss: {(loss_real+loss_fake):.4f} G Loss: {loss_g:.4f}")
+
+                    self.print_losses(loss_d, loss_real, loss_fake, loss_g)
+
                     GanTrainer.save_gan_checkpoint(
                         generator,
                         optimizerG,
@@ -310,14 +371,15 @@ class GanTrainer:
                         optimizerD,
                         self.config.checkpoint_path,
                     )
-                    image_utils.show_image_eval("real", real, loss_real)
-                    image_utils.show_image_eval("fake", fake, loss_fake)
-                    image_utils.display_images(fake)
 
-        print("Training GAN done.")
+                    image_utils.show_image_eval("real", real, loss_real)
+                    image_utils.show_image_eval("fake", fake.detach(), loss_fake)
+                    image_utils.display_images(fake.detach())
+
+        self.logger.info("Training GAN done.")
 
 
 if __name__ == "__main__":
     logger = common.create_logger()
-    ganTrainer = GanTrainer.from_yaml(profile_name="gan_small", logger)
+    ganTrainer = GanTrainer.from_yaml(profile_name="gan_small", logger=logger)
     ganTrainer.train()

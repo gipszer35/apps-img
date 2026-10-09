@@ -1,88 +1,171 @@
+import os
+import sys
+import datetime
+import random
+import dataclasses
+import yaml
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+
 import torchvision.transforms as transforms
-import matplotlib.pyplot as plt
-import os
-import datetime
-import sys
-import random
 from torchvision.transforms import functional as F
 
-
-# BEGIN BASIC SETUP
-def is_colab():
-    return "COLAB_GPU" in os.environ
+from PIL import Image
+import matplotlib.pyplot as plt
 
 
-if is_colab():
-    if not os.path.ismount("/content/drive"):
-        from google.colab import drive
+class Environment:
+    _instance = None
 
-        drive.mount("/content/drive")
-    ROOT_DIR = "/content/drive/MyDrive/"
-    IMAGE_GENERATOR_DIR = ROOT_DIR + "ImageGenerator/"
-    NUM_PATCHES_PER_IMAGE = 4
-    BATCH_SIZE = 64
-else:
-    ROOT_DIR = "./"
-    IMAGE_GENERATOR_DIR = ROOT_DIR
-    NUM_PATCHES_PER_IMAGE = 5
-    BATCH_SIZE = 4
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialize()
+        return cls._instance
+
+    def _initialize(self):
+        self.content_drive = "/content/drive"
+        self.is_colab = "google.colab" in sys.modules
+
+        if self.is_colab:
+            self._mount_colab()
+
+            self.root_dir = os.path.join(self.content_drive, "MyDrive")
+            self.apps_img = os.path.join(self.root_dir, "apps-img")
+            self.images_dir = os.path.join(self.root_dir, "images_few")
+        else:
+            self.root_dir = os.path.expanduser("~/work")
+            self.apps_img = os.path.join(self.root_dir, "apps-img")
+            self.images_dir = os.path.join(self.apps_img, "images", "my-images")
+
+        self.work_dir = os.path.join(self.apps_img, "autoencoder")
+
+        os.makedirs(self.work_dir, exist_ok=True)
+
+        for path in (
+            self.root_dir,
+            self.apps_img,
+            self.work_dir,
+        ):
+            if path not in sys.path:
+                sys.path.append(path)
+
+        import common
+        import image_utils
+
+        globals()["common"] = common
+        globals()["image_utils"] = image_utils
+
+    def _mount_colab(self):
+        if not os.path.ismount(self.content_drive):
+            from google.colab import drive
+
+            drive.mount(self.content_drive)
 
 
-sys.path.append(ROOT_DIR)
-import my_common as my
-
-my.test_function()
-# END BASIC SETUP
-
-# IMAGES_DIR = ROOT_DIR + "images"
-IMAGES_DIR = ROOT_DIR + "pattern_images"
-
-AUTOENCODER_CHECKPOINT_PATH = ROOT_DIR + "/autoencoder.pt"
-IMAGE_SIZE = 256  # IMAGE_SIZE x IMAGE_SIZE
-CROP_IMAGE_SIZE = IMAGE_SIZE + 20
+# Initialize the environment before using common/image_utils.
+Environment()
 
 
-def show_resized_image(model, sr_dataset):
-    model.eval()
-    with torch.no_grad():
-        idx = random.randint(0, len(sr_dataset) - 1)
-        test_lr, test_hr = sr_dataset[idx]
+@dataclasses.dataclass
+class AutoencoderConfig:
+    # Automatically populated environment paths.
+    work_dir: str
+    images_dir: str
+    content_drive: str
 
-        test_lr = test_lr.unsqueeze(0).to(my.DEVICE)
-        output_hr = model(test_lr).cpu().squeeze(0)
+    # Training configuration.
+    batch_size: int
+    epoch: int
+    lr: float
+    beta1: float
+    num_workers: int
 
-        test_lr_denorm = my.denormalize(test_lr.cpu().squeeze(0))
-        test_hr_denorm = my.denormalize(test_hr.cpu().squeeze(0))
-        output_hr_denorm = my.denormalize(output_hr)
+    # Image configuration.
+    num_channel: int
+    image_size: int
+    lr_image_size: int
+    crop_image_size: int
+    num_patches_per_image: int
 
-        # Image display helper function
-        def imshow(img, title):
-            # Convert from Tensor (C, H, W) to Numpy (H, W, C)
-            img = img.numpy().transpose((1, 2, 0))
-            plt.imshow(img)
-            plt.title(title)
-            plt.axis("off")
+    # Checkpoint configuration.
+    checkpoint_name: str
 
-        plt.figure(figsize=(10, 6))
-        plt.subplot(1, 3, 1)
-        imshow(test_lr_denorm, "Input 32x32")
-        plt.subplot(1, 3, 2)
-        imshow(test_hr_denorm, "Target (Ground Truth)")
-        plt.subplot(1, 3, 3)
-        imshow(output_hr_denorm, "Generated Image")
-        plt.show()
+    # Loss configuration.
+    perceptual_weight: float = 0.1
+
+    # Logging and visualization.
+    log_interval: int = 50
+    show_images: bool = True
+
+    # Optimizer configuration.
+    beta2: float = 0.999
+
+    @classmethod
+    def create(cls, **kwargs) -> "AutoencoderConfig":
+        env = Environment()
+
+        kwargs.update(
+            {
+                "work_dir": env.work_dir,
+                "images_dir": env.images_dir,
+                "content_drive": env.content_drive,
+            }
+        )
+
+        # Environment-dependent defaults.
+        kwargs.setdefault(
+            "batch_size",
+            64 if env.is_colab else 4,
+        )
+        kwargs.setdefault(
+            "num_workers",
+            2,
+        )
+        kwargs.setdefault(
+            "num_patches_per_image",
+            4 if env.is_colab else 5,
+        )
+
+        # Apply dataclass defaults for optional fields.
+        for field in dataclasses.fields(cls):
+            if field.name not in kwargs and field.default is not dataclasses.MISSING:
+                kwargs[field.name] = field.default
+
+        return cls(**kwargs)
+
+    @property
+    def out_dir(self):
+        return os.path.join(self.work_dir, "out_dir")
+
+    @property
+    def checkpoint_path(self):
+        return os.path.join(self.out_dir, self.checkpoint_name)
+
+    @property
+    def cropped_images_path(self):
+        return os.path.join(
+            self.out_dir,
+            f"cropped_{self.image_size}.pt",
+        )
 
 
 class ResBlock(nn.Module):
-    def __init__(self, channels, *, p=0.7):
+    def __init__(self, channels, p=0.7):
         super().__init__()
+
         self.p = p
+
         self.sequential = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+            ),
             nn.BatchNorm2d(channels),
             nn.LeakyReLU(inplace=True),
         )
@@ -93,26 +176,42 @@ class ResBlock(nn.Module):
 
 def upshuffle(in_channels, out_channels, scale=2):
     return nn.Sequential(
-        nn.Conv2d(in_channels, out_channels * (scale**2), 3, padding=1),
+        nn.Conv2d(
+            in_channels,
+            out_channels * (scale**2),
+            kernel_size=3,
+            padding=1,
+        ),
         nn.ReLU(inplace=True),
         nn.PixelShuffle(scale),
         nn.BatchNorm2d(out_channels),
-        nn.ReLU(),
+        nn.ReLU(inplace=True),
     )
 
 
 def downsample(in_channels, out_channels):
     return nn.Sequential(
-        nn.Conv2d(in_channels, out_channels, 3, stride=2, padding=1),
+        nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+        ),
         nn.BatchNorm2d(out_channels),
-        nn.ReLU(),
+        nn.ReLU(inplace=True),
     )
 
 
 class SuperResolutionAutoEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, config: AutoencoderConfig):
         super().__init__()
+
+        self.config = config
+
+        # Preserve the original architecture's channel layout.
         divisor = 2
+
         channel256x256 = 256 // divisor
         channel128x128 = 128 // divisor
         channel64x64 = 128 // divisor
@@ -120,68 +219,162 @@ class SuperResolutionAutoEncoder(nn.Module):
         channel16x16 = 512 // divisor
         channel8x8 = 256 // divisor
 
-        self.down_conv1 = nn.Conv2d(3, channel32x32, 3, padding=1)  # 32x32
-        self.down_sample1 = downsample(channel32x32, channel16x16)
-        self.down_conv2 = ResBlock(channel16x16)  # 16x16
-        self.down_sample2 = downsample(channel16x16, channel8x8)
-        self.bottleneck = ResBlock(channel8x8)  # 8x8
-        self.up_sample1 = upshuffle(channel8x8, channel16x16)
-        self.up_conv1 = ResBlock(channel16x16 * 2)  # 16x16
-        self.up_sample2 = upshuffle(channel16x16 * 2, channel32x32)
-        self.up_conv2 = ResBlock(channel32x32 * 2)  # 32x32
-        self.up_sample3 = upshuffle(channel32x32 * 2, channel64x64)
-        self.up_conv3 = ResBlock(channel64x64)  # 64x64
-        self.up_sample4 = upshuffle(channel64x64, channel128x128)
-        self.up_conv4 = ResBlock(channel128x128)  # 128x128
-        self.up_sample5 = upshuffle(channel128x128, channel256x256)
-        self.out = nn.Conv2d(channel256x256, 3, 5, padding=2)  # 256x256
+        # Encoder: 32x32 -> 16x16 -> 8x8.
+        self.down_conv1 = nn.Conv2d(
+            config.num_channel,
+            channel32x32,
+            kernel_size=3,
+            padding=1,
+        )
+
+        self.down_sample1 = downsample(
+            channel32x32,
+            channel16x16,
+        )
+
+        self.down_conv2 = ResBlock(
+            channel16x16,
+        )
+
+        self.down_sample2 = downsample(
+            channel16x16,
+            channel8x8,
+        )
+
+        self.bottleneck = ResBlock(
+            channel8x8,
+        )
+
+        # Decoder: 8x8 -> 16x16 -> 32x32.
+        self.up_sample1 = upshuffle(
+            channel8x8,
+            channel16x16,
+        )
+
+        self.up_conv1 = ResBlock(
+            channel16x16 * 2,
+        )
+
+        self.up_sample2 = upshuffle(
+            channel16x16 * 2,
+            channel32x32,
+        )
+
+        self.up_conv2 = ResBlock(
+            channel32x32 * 2,
+        )
+
+        # Decoder: 32x32 -> 64x64 -> 128x128 -> 256x256.
+        self.up_sample3 = upshuffle(
+            channel32x32 * 2,
+            channel64x64,
+        )
+
+        self.up_conv3 = ResBlock(
+            channel64x64,
+        )
+
+        self.up_sample4 = upshuffle(
+            channel64x64,
+            channel128x128,
+        )
+
+        self.up_conv4 = ResBlock(
+            channel128x128,
+        )
+
+        self.up_sample5 = upshuffle(
+            channel128x128,
+            channel256x256,
+        )
+
+        self.out = nn.Conv2d(
+            channel256x256,
+            config.num_channel,
+            kernel_size=5,
+            padding=2,
+        )
 
     def forward(self, x):
-        # Encoder
-
-        down_conv1 = self.down_conv1(x)  # 32×32
+        # Encoder.
+        down_conv1 = self.down_conv1(x)
         down_sample1 = self.down_sample1(down_conv1)
-        down_conv2 = self.down_conv2(down_sample1)  # 16x16
-        down_sample2 = self.down_sample2(down_conv2)
-        bottleneck = self.bottleneck(down_sample2)  # 8x8
-        up_sample1 = self.up_sample1(bottleneck)
-        cat1 = torch.cat([up_sample1, down_conv2], dim=1)
-        up_conv1 = self.up_conv1(cat1)  # 16x16
-        up_sample2 = self.up_sample2(up_conv1)
-        cat2 = torch.cat([up_sample2, down_conv1], dim=1)
-        up_conv2 = self.up_conv2(cat2)  # 32x32
-        up_sample3 = self.up_sample3(up_conv2)
-        up_conv3 = self.up_conv3(up_sample3)  # 64x64
-        up_sample4 = self.up_sample4(up_conv3)
-        up_conv4 = self.up_conv4(up_sample4)  # 128x128
-        up_sample5 = self.up_sample5(up_conv4)
-        out = self.out(up_sample5)  # 256x256
 
-        # print("out:", out[0][1][12][1:3])
-        tanh_out = torch.tanh(out)
-        return tanh_out
+        down_conv2 = self.down_conv2(down_sample1)
+        down_sample2 = self.down_sample2(down_conv2)
+
+        bottleneck = self.bottleneck(down_sample2)
+
+        # Decoder with skip connections.
+        up_sample1 = self.up_sample1(bottleneck)
+
+        cat1 = torch.cat(
+            [up_sample1, down_conv2],
+            dim=1,
+        )
+
+        up_conv1 = self.up_conv1(cat1)
+        up_sample2 = self.up_sample2(up_conv1)
+
+        cat2 = torch.cat(
+            [up_sample2, down_conv1],
+            dim=1,
+        )
+
+        up_conv2 = self.up_conv2(cat2)
+        up_sample3 = self.up_sample3(up_conv2)
+
+        up_conv3 = self.up_conv3(up_sample3)
+        up_sample4 = self.up_sample4(up_conv3)
+
+        up_conv4 = self.up_conv4(up_sample4)
+        up_sample5 = self.up_sample5(up_conv4)
+
+        out = self.out(up_sample5)
+
+        return torch.tanh(out)
 
 
 class SuperResolutionDataset(torch.utils.data.Dataset):
-    def __init__(self, base_dataset, lr_size=32):
+    def __init__(
+        self,
+        base_dataset,
+        config: AutoencoderConfig,
+    ):
         self.base_dataset = base_dataset
-        self.lr_size = lr_size
+        self.config = config
 
-        self.hr_transform = transforms.Compose([
-            transforms.Lambda(
-                lambda img: F.rotate(img, random.choice([0, 90, 180, 270]))
-            ),
-            transforms.RandomCrop((IMAGE_SIZE, IMAGE_SIZE)),
-            transforms.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.05, hue=0.05),
+        self.hr_transform = transforms.Compose(
+            [
+                transforms.Lambda(
+                    lambda img: F.rotate(
+                        img,
+                        random.choice([0, 90, 180, 270]),
+                    )
+                ),
+                transforms.RandomCrop(
+                    (
+                        config.image_size,
+                        config.image_size,
+                    )
+                ),
+                transforms.ColorJitter(
+                    brightness=0.05,
+                    contrast=0.05,
+                    saturation=0.05,
+                    hue=0.05,
+                ),
             ]
         )
-
 
         self.lr_transform = transforms.Compose(
             [
                 transforms.Resize(
-                    (lr_size, lr_size),
-                    interpolation=transforms.InterpolationMode.BICUBIC,
+                    (
+                        config.lr_image_size,
+                        config.lr_image_size,
+                    ),
+                    interpolation=(transforms.InterpolationMode.BICUBIC),
                 )
             ]
         )
@@ -193,104 +386,340 @@ class SuperResolutionDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         image, _ = self.base_dataset[idx]
+
         if isinstance(image, torch.Tensor):
-            image = my.denormalize(image)
+            image = common.denormalize(image)
             image = F.to_pil_image(image)
 
+        # Create the high-resolution target.
         image_hr = self.hr_transform(image)
+
+        # Downsample the same image to create the input.
         image_lr = self.lr_transform(image_hr)
-        image_hr = my.normalize(self.to_tensor(image_hr))
-        image_lr = my.normalize(self.to_tensor(image_lr))
+
+        image_hr = common.normalize(self.to_tensor(image_hr))
+
+        image_lr = common.normalize(self.to_tensor(image_lr))
 
         return image_lr, image_hr
 
-def init_model():
-    model = SuperResolutionAutoEncoder().to(my.DEVICE)
-    my.print_parameter_summary(model)
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-    my.load_checkpoint_if_exists(model, optimizer, AUTOENCODER_CHECKPOINT_PATH)
-    return model,optimizer
 
-def init():
-    dataset = my.cropped_dataset(
-        IMAGES_DIR,
-        crop_size=CROP_IMAGE_SIZE,
-        num_patches_per_image=NUM_PATCHES_PER_IMAGE,
-    )
-    sr_dataset = SuperResolutionDataset(dataset)
-    dataloader = DataLoader(
-        sr_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2
-    )
-    model, optimizer = init_model()
-    return model, dataloader, optimizer, sr_dataset
+class AutoencoderTrainer:
+    def __init__(
+        self,
+        logger,
+        config: AutoencoderConfig,
+    ):
+        self.logger = logger
+        self.config = config
 
-import torch
-from torchvision import transforms
-from PIL import Image
-import matplotlib.pyplot as plt
+        os.makedirs(
+            self.config.out_dir,
+            exist_ok=True,
+        )
 
-def upscale_and_show_one_image(image_path, model):
-    model.eval()
-    img = Image.open(image_path).convert("RGB")
-    img = img.resize((32, 32), Image.Resampling.BICUBIC)
+        self.model = None
+        self.optimizer = None
+        self.dataloader = None
+        self.sr_dataset = None
 
-    transform = transforms.ToTensor()
-    input_tensor = transform(img).unsqueeze(0).to(next(model.parameters()).device)
-    with torch.no_grad():
-        output_tensor = model(my.normalize(input_tensor))
-    output_tensor = my.denormalize(output_tensor)
+    @classmethod
+    def from_yaml(
+        cls,
+        profile_name: str,
+        logger,
+        config_path: str = "config.yaml",
+    ):
+        if not os.path.isabs(config_path):
+            env = Environment()
 
-    output_img = transforms.ToPILImage()(output_tensor.squeeze(0).cpu())
+            config_path = os.path.join(
+                env.work_dir,
+                config_path,
+            )
 
-    plt.figure(figsize=(8, 4))
-    plt.subplot(1, 2, 1)
-    plt.title("Input 32×32")
-    plt.imshow(img)
-    plt.axis("off")
+        with open(config_path, "r") as f:
+            full_config = yaml.safe_load(f)
 
-    plt.subplot(1, 2, 2)
-    plt.title("Upscaled 256×256")
-    plt.imshow(output_img)
-    plt.axis("off")
+        profile = full_config["trainers"][profile_name]
 
-    plt.show()
+        config = AutoencoderConfig.create(**profile)
 
+        return cls(
+            logger=logger,
+            config=config,
+        )
 
-def train(model, dataloader, optimizer, sr_dataset):
-    x=0
-    criterion = my.SRLoss(perceptual_weight=0.1)
-    num_epochs = 10000
-    print("Starting training...")
-    for epoch in range(num_epochs):
-        train_loss = 0
-        for batch_idx, (lr_imgs, hr_imgs) in enumerate(dataloader):
-            model.train()
-            lr_imgs = lr_imgs.to(my.DEVICE)
-            hr_imgs = hr_imgs.to(my.DEVICE)
+    def prepare_dataloader(self):
+        self.logger.info("Preparing super-resolution dataset")
 
-            # Forward pass
-            outputs = model(lr_imgs)
-            loss = criterion(outputs, hr_imgs)
+        config = self.config
 
-            # Backward pass and optimization
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        # Keep using the project's image-patch dataset.
+        base_dataset = image_utils.cropped_dataset(
+            config.images_dir,
+            crop_size=config.crop_image_size,
+            num_patches_per_image=(config.num_patches_per_image),
+        )
 
-            train_loss += loss.item()
-            mod=50
-            if x % mod == 0:
-                now = datetime.datetime.now()
-                print("Current date and time::", now.strftime("%Y-%m-%d %H:%M:%S"))
-                print(f"Epoch [{epoch+1}/{num_epochs}], Temp loss: {loss.item():.4f}")
-                my.save_checkpoint(model, optimizer, AUTOENCODER_CHECKPOINT_PATH)
-                show_resized_image(model, sr_dataset)
-            x+=1
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {train_loss/len(dataloader):.4f}")
-    print("Training finished.")
+        self.sr_dataset = SuperResolutionDataset(
+            base_dataset,
+            config,
+        )
+
+        self.dataloader = DataLoader(
+            self.sr_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+        )
+
+        self.logger.info(f"Dataset size: {len(self.sr_dataset)}")
+
+        self.logger.info(
+            f"Batches: {len(self.dataloader)} | "
+            f"Batch size: {config.batch_size} | "
+            f"LR size: {config.lr_image_size} | "
+            f"HR size: {config.image_size}"
+        )
+
+        return self.dataloader
+
+    @staticmethod
+    def save_checkpoint(
+        model,
+        optimizer,
+        path,
+        epoch,
+    ):
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+            },
+            path,
+        )
+
+    def load_checkpoint_if_exists(self):
+        path = self.config.checkpoint_path
+
+        if not os.path.isfile(path):
+            self.logger.info(f"No checkpoint found at {path}")
+            return 0
+
+        checkpoint = torch.load(
+            path,
+            map_location=common.DEVICE,
+        )
+
+        self.model.load_state_dict(checkpoint["model"])
+
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+
+        start_epoch = checkpoint.get("epoch", 0)
+
+        self.logger.info(
+            f"Loaded checkpoint from {path}; " f"resuming at epoch {start_epoch + 1}"
+        )
+
+        return start_epoch
+
+    def initialize_model(self):
+        self.model = SuperResolutionAutoEncoder(self.config).to(common.DEVICE)
+
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=self.config.lr,
+            betas=(
+                self.config.beta1,
+                self.config.beta2,
+            ),
+        )
+
+        self.logger.info("Super-resolution autoencoder")
+
+        common.print_parameter_summary(self.model)
+
+        start_epoch = self.load_checkpoint_if_exists()
+
+        return start_epoch
+
+    @staticmethod
+    def show_tensor_image(img, title):
+        img = img.detach().cpu()
+
+        img = common.denormalize(img)
+        img = img.clamp(0, 1)
+
+        img = img.permute(1, 2, 0).numpy()
+
+        plt.imshow(img)
+        plt.title(title)
+        plt.axis("off")
+
+    def show_resized_image(self):
+        if self.sr_dataset is None or len(self.sr_dataset) == 0:
+            return
+
+        self.model.eval()
+
+        with torch.no_grad():
+            idx = random.randrange(len(self.sr_dataset))
+
+            test_lr, test_hr = self.sr_dataset[idx]
+
+            test_lr = test_lr.unsqueeze(0).to(common.DEVICE)
+
+            output_hr = self.model(test_lr).squeeze(0)
+
+        plt.figure(figsize=(12, 4))
+
+        plt.subplot(1, 3, 1)
+        self.show_tensor_image(
+            test_lr.squeeze(0),
+            f"Input {self.config.lr_image_size}x" f"{self.config.lr_image_size}",
+        )
+
+        plt.subplot(1, 3, 2)
+        self.show_tensor_image(
+            test_hr,
+            "Target",
+        )
+
+        plt.subplot(1, 3, 3)
+        self.show_tensor_image(
+            output_hr,
+            "Generated",
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+    def upscale_and_show_one_image(self, image_path):
+        self.model.eval()
+
+        image = Image.open(image_path).convert("RGB")
+
+        image = image.resize(
+            (
+                self.config.lr_image_size,
+                self.config.lr_image_size,
+            ),
+            Image.Resampling.BICUBIC,
+        )
+
+        input_tensor = transforms.ToTensor()(image).unsqueeze(0)
+
+        input_tensor = common.normalize(input_tensor).to(common.DEVICE)
+
+        with torch.no_grad():
+            output_tensor = self.model(input_tensor)
+
+        output_tensor = common.denormalize(output_tensor.squeeze(0).cpu()).clamp(0, 1)
+
+        output_image = transforms.ToPILImage()(output_tensor)
+
+        plt.figure(figsize=(10, 5))
+
+        plt.subplot(1, 2, 1)
+        plt.imshow(image)
+        plt.title("Low-resolution input")
+        plt.axis("off")
+
+        plt.subplot(1, 2, 2)
+        plt.imshow(output_image)
+        plt.title(f"Generated {self.config.image_size}x" f"{self.config.image_size}")
+        plt.axis("off")
+
+        plt.tight_layout()
+        plt.show()
+
+    def train(self):
+        config = self.config
+
+        self.logger.info("Starting super-resolution training")
+
+        self.prepare_dataloader()
+        start_epoch = self.initialize_model()
+
+        criterion = common.SRLoss(perceptual_weight=config.perceptual_weight)
+
+        global_step = 0
+
+        for epoch in range(
+            start_epoch,
+            config.epoch,
+        ):
+            self.model.train()
+
+            total_loss = 0.0
+
+            for batch_idx, (lr_imgs, hr_imgs) in enumerate(self.dataloader):
+                lr_imgs = lr_imgs.to(common.DEVICE)
+
+                hr_imgs = hr_imgs.to(common.DEVICE)
+
+                # Forward pass.
+                outputs = self.model(lr_imgs)
+                loss = criterion(outputs, hr_imgs)
+
+                # Backward pass.
+                self.optimizer.zero_grad(set_to_none=True)
+
+                loss.backward()
+                self.optimizer.step()
+
+                total_loss += loss.item()
+                global_step += 1
+
+                if global_step % config.log_interval == 0:
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    self.logger.info(
+                        f"Time: {now} | "
+                        f"Epoch [{epoch + 1}/{config.epoch}] | "
+                        f"Step [{batch_idx + 1}/"
+                        f"{len(self.dataloader)}] | "
+                        f"Loss: {loss.item():.4f}"
+                    )
+
+                    self.save_checkpoint(
+                        self.model,
+                        self.optimizer,
+                        config.checkpoint_path,
+                        epoch + 1,
+                    )
+
+                    if config.show_images:
+                        self.show_resized_image()
+
+            avg_loss = (
+                total_loss / len(self.dataloader) if len(self.dataloader) > 0 else 0.0
+            )
+
+            self.logger.info(
+                f"Epoch [{epoch + 1}/{config.epoch}] "
+                f"completed | Average loss: {avg_loss:.4f}"
+            )
+
+            # Save at the end of every epoch, too.
+            self.save_checkpoint(
+                self.model,
+                self.optimizer,
+                config.checkpoint_path,
+                epoch + 1,
+            )
+
+        self.logger.info("Super-resolution training finished.")
 
 
 if __name__ == "__main__":
-    model, dataloader, optimizer, sr_dataset = init()
-    train(model, dataloader, optimizer, sr_dataset)
+    logger = common.create_logger()
 
+    trainer = AutoencoderTrainer.from_yaml(
+        profile_name="autoencoder_small",
+        logger=logger,
+    )
+
+    trainer.train()
