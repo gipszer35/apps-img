@@ -9,6 +9,7 @@ import torchvision.transforms as transforms
 import torch.optim as optim
 import dataclasses
 import yaml
+from torch.utils.data import DataLoader
 
 
 class Environment:
@@ -61,7 +62,7 @@ Environment()
 
 @dataclasses.dataclass(frozen=False)
 class GanConfig:
-    # Environment paths generated automatically from the Environment Singleton
+    # Environment paths
     work_dir: str
     images_dir: str
     content_drive: str
@@ -71,21 +72,27 @@ class GanConfig:
     epoch: int
     checkpoint_name: str
 
-    # Explicit architecture and training hyperparameters
-    image_size: int
-    latent_vector_size: int
+    # Image and latent dimensions
+    image_size: int = 32
+    input_size: int = 32
+    latent_vector_size: int = 128
+    generator_base: int = 512
+    discriminator_base: int = 256
 
-    # Static constants
+    # Training mode
+    super_resolution: bool = False
+
+    # Loss weights
+    reconstruction_weight: float = 1.0
+
+    # Learning rates: change these directly in the source
     lr_generator: float = 1e-4
     lr_discriminator: float = 1e-4
 
     @classmethod
     def create(cls, **kwargs) -> "GanConfig":
-        """Factory method that dynamically resolves defaults for ALL dataclass fields."""
-
         env = Environment()
 
-        # Inject the mandatory environment paths
         kwargs.update(
             {
                 "work_dir": env.work_dir,
@@ -94,9 +101,8 @@ class GanConfig:
             }
         )
 
-        kwargs.setdefault("batch_size", 2048 if env.is_colab else 2)
+        kwargs.setdefault("batch_size", 64 if env.is_colab else 2)
 
-        # Dynamically loop through all defined fields in the class
         for field in dataclasses.fields(cls):
             if field.name not in kwargs and field.default is not dataclasses.MISSING:
                 kwargs[field.name] = field.default
@@ -108,58 +114,152 @@ class GanConfig:
         return os.path.join(self.work_dir, "out_dir")
 
     @property
-    def checkpoint_path(self) -> str:
+    def checkpoint_path(self):
         return os.path.join(self.out_dir, self.checkpoint_name)
 
     @property
-    def cropped_images_path(self) -> str:
-        return os.path.join(self.out_dir, f"cropped_{self.image_size}.pt")
+    def cropped_images_path(self):
+        return os.path.join(
+            self.out_dir,
+            f"cropped_{self.image_size}.pt",
+        )
+
+
+class StochasticResidualBlock(nn.Module):
+    """Residual block with mid-block stochastic noise injection for texture generation."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            GaussianNoise(0.03),
+            nn.GroupNorm(min(32, channels), channels),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(32, channels), channels),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
 
 
 class Generator(nn.Module):
-    def __init__(
-        self,
-        config,
-        base=256,
-    ):
+    """
+    Super-Resolution Generator.
+    Can be called in two ways:
+    1. generator(low_res_image)
+    2. generator() - generates from pure Gaussian noise
+
+    ResNet blocks are applied after each upsampling stage.
+    """
+
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        # project latent vector to 4×4
-        self.fc = nn.Sequential(
-            nn.Linear(config.latent_vector_size, base * 4 * 4),
+        self.base = config.generator_base
+
+        # Feature encoder
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(
+                config.num_channel,
+                self.base // 4,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(
+                self.base // 4,
+                self.base // 2,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
         )
 
-        # We will build: 4→8→16→32 (upsampling)
-        self.main = nn.Sequential(
-            # 4×4 → 8×8
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(base, base, kernel_size=3, padding=1, bias=False),
-            common.GaussianNoise(0.1),
-            nn.GroupNorm(32, base),
-            nn.LeakyReLU(0.2, inplace=True),
-            # 8×8 → 16×16
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(base, base // 2, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(32, base // 2),
-            nn.LeakyReLU(0.2, inplace=True),
-            # 16×16 → 32×32
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(base // 2, base // 4, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(32, base // 4),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base // 4, config.num_channel, kernel_size=3, padding=1),
-            nn.Tanh(),
+        # Determine the number of upsampling stages
+        current_size = config.input_size
+        stage_sizes = []
+
+        while current_size < config.image_size:
+            current_size *= 2
+            stage_sizes.append(current_size)
+
+        num_stages = len(stage_sizes)
+        channels = self.base // 2
+        decoder_layers = []
+
+        # Add ResNet block after each upsampling stage
+        for i in range(num_stages):
+            next_channels = max(self.base // 4, channels // 2)
+
+            # Upsampling stage
+            decoder_layers.extend(
+                [
+                    nn.Upsample(
+                        scale_factor=2,
+                        mode="nearest",
+                    ),
+                    nn.Conv2d(
+                        channels,
+                        next_channels,
+                        kernel_size=3,
+                        padding=1,
+                        bias=False,
+                    ),
+                    nn.GroupNorm(
+                        min(32, next_channels),
+                        next_channels,
+                    ),
+                    nn.LeakyReLU(0.2, inplace=True),
+                ]
+            )
+
+            channels = next_channels
+
+            # ResNet block after upsampling
+            decoder_layers.append(StochasticResidualBlock(channels))
+
+        # Fallback if input and output sizes are already equal (no upsampling needed)
+        if num_stages == 0:
+            decoder_layers.append(StochasticResidualBlock(channels))
+
+        # Final output projection
+        decoder_layers.extend(
+            [
+                nn.Conv2d(
+                    channels,
+                    config.num_channel,
+                    kernel_size=3,
+                    padding=1,
+                ),
+                nn.Tanh(),
+            ]
         )
 
-    def forward(self, z):
-        x = self.fc(z)
-        x = x.view(z.size(0), -1, 4, 4)
-        return self.main(x)
+        self.decoder = nn.Sequential(*decoder_layers)
+
+    def forward(self, x=None):
+        # Generate Gaussian noise if no input is provided
+        if x is None:
+            x = torch.randn(
+                self.config.batch_size,
+                self.config.num_channel,
+                self.config.input_size,
+                self.config.input_size,
+                device=next(self.parameters()).device,
+            )
+
+        x = self.input_conv(x)
+        x = self.decoder(x)
+
+        return x
 
 
 class Discriminator(nn.Module):
-    def __init__(self, config, base=256):
+    def __init__(self, config):
         super().__init__()
+        self.config = config
+        self.base = config.discriminator_base
 
         def block(in_c, out_c):
             return nn.Sequential(
@@ -171,23 +271,47 @@ class Discriminator(nn.Module):
                     padding=1,
                 ),
                 common.GaussianNoise(0.1),
-                nn.GroupNorm(32, out_c),
+                nn.GroupNorm(
+                    min(32, out_c),
+                    out_c,
+                ),
                 nn.LeakyReLU(0.2, inplace=True),
             )
 
-        self.blocks = nn.Sequential(
-            block(config.num_channel, base // 4),  # 32 -> 16
-            block(base // 4, base // 2),  # 16 -> 8
-            block(base // 2, base),  # 8 -> 4
-            block(base, base * 2),  # 4 -> 2
-        )
+        channels = [
+            max(self.base // 4, 32),
+            max(self.base // 2, 32),
+            self.base,
+            self.base * 2,
+            self.base * 4,
+            self.base * 8,
+        ]
 
-        self.final = nn.Conv2d(base * 2, 1, kernel_size=2)  # 2 -> 1
+        layers = []
+        in_channels = config.num_channel
+
+        current_size = config.image_size
+
+        for out_channels in channels:
+            if current_size < 2:
+                break
+
+            layers.append(block(in_channels, out_channels))
+
+            in_channels = out_channels
+            current_size //= 2
+
+        self.blocks = nn.Sequential(*layers)
+
+        self.final = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, 1),
+        )
 
     def forward(self, x):
         x = self.blocks(x)
-        x = self.final(x)
-        return x.view(x.size(0))
+        return self.final(x).view(-1)
 
 
 class GanTrainer:
@@ -195,6 +319,7 @@ class GanTrainer:
         self.logger = logger
         self.config = config
         self.multi_loss_tracker = common.MultiLossTracker()
+        self.image_manager = image_utils.ImageManager(logger, config.images_dir)
 
         if not os.path.exists(self.config.out_dir):
             self.logger.info(f"Creating output directory: {self.config.out_dir}")
@@ -240,7 +365,60 @@ class GanTrainer:
         else:
             print(f"No checkpoint found at {path}, skipping load.")
 
-    def prepare_dataloader(self):
+    def resize_to_input(self, images):
+        return nn.functional.interpolate(
+            images,
+            size=(
+                self.config.input_size,
+                self.config.input_size,
+            ),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+
+    def prepare_cropped_image_dataloader(self):
+        self.logger.info("Creating dataset and preparing dataloader...")
+
+        self.image_manager.cache_images_from_image_dataset(
+            self.config.cropped_images_path, self.config.image_size
+        )
+        cache_file = self.config.cropped_images_path
+        images = torch.load(
+            cache_file,
+            map_location="cpu",
+        )
+        transform = transforms.Compose(
+            [
+                image_utils.Random90Rotation(),
+                transforms.RandomAffine(
+                    degrees=0,
+                    translate=(0.04, 0.04),
+                    fill=0,
+                ),
+                transforms.Normalize(
+                    mean=[0.5] * self.config.num_channel,
+                    std=[0.5] * self.config.num_channel,
+                ),
+            ]
+        )
+
+        dataset = image_utils.ImageManager.CachedImageDataset(
+            images,
+            transform=transform,
+        )
+
+        self.logger.info(
+            f"Dataloader successfully initialized with {len(dataset)} samples."
+        )
+
+        return DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+        )
+
+    def prepare_cifar_dataloader(self):
         self.logger.info("Preparing datasets and dataloader")
 
         cifar_cache_path = os.path.join(self.config.out_dir, "cifar100_dataset.pt")
@@ -286,22 +464,54 @@ class GanTrainer:
 
         self.logger.info(f"G Loss: {loss_g.item():.4f} (avg: {avg_loss_g:.4f})")
 
+    def random_batch_crop(self, real_full):
+        """
+        Efficiently crops an entire batch of images to the target size
+        specified in config.image_size at a random location.
+
+        Args:
+            real_full (Tensor): Input batch tensor of shape [B, C, H, W]
+
+        Returns:
+            Tensor: Cropped batch tensor of shape [B, C, target_size, target_size]
+        """
+        full_height = real_full.size(2)
+        full_width = real_full.size(3)
+        target_size = self.config.image_size
+
+        # Calculate the maximum possible start indices to avoid out-of-bounds
+        max_h = full_height - target_size
+        max_w = full_width - target_size
+
+        # Randomly sample top-left coordinates within the safe range
+        h_start = torch.randint(0, max_h + 1, (1,)).item()
+        w_start = torch.randint(0, max_w + 1, (1,)).item()
+
+        # Perform zero-copy slicing on the GPU
+        return real_full[
+            :, :, h_start : h_start + target_size, w_start : w_start + target_size
+        ]
+
     def train(self):
         generator = Generator(self.config).to(common.DEVICE)
         discriminator = Discriminator(self.config).to(common.DEVICE)
+
         criterion = nn.BCEWithLogitsLoss()
+        reconstruction_criterion = image_utils.SRLoss(perceptual_weight=0.1)
+
         optimizerD = optim.Adam(
             discriminator.parameters(),
             lr=self.config.lr_discriminator,
             betas=(self.config.beta, 0.999),
         )
+
         optimizerG = optim.Adam(
             generator.parameters(),
             lr=self.config.lr_generator,
             betas=(self.config.beta, 0.999),
         )
 
-        dataloader = self.prepare_dataloader()
+        dataloader = self.prepare_cropped_image_dataloader()
 
         GanTrainer.load_gan_checkpoint_if_exists(
             generator,
@@ -310,46 +520,85 @@ class GanTrainer:
             optimizerD,
             self.config.checkpoint_path,
         )
-        logger.info("Generator")
+
+        self.logger.info("Generator")
         common.print_parameter_summary(generator)
-        logger.info("Discriminator")
+
+        self.logger.info("Discriminator")
         common.print_parameter_summary(discriminator)
 
-        # Training loop
+        i = -1
         for epoch in range(self.config.epoch):
-            for i, (images, _) in enumerate(dataloader):
-                real = images.to(common.DEVICE)
+            for batch in dataloader:
+                i += 1
+                images = batch if isinstance(batch, (tuple, list)) else batch
+
+                # Move the original full-size images to the GPU
+                real_full = images.to(common.DEVICE)
+
+                # Efficiently crop the entire batch using the standalone function
+                real = self.random_batch_crop(real_full)
+
                 batch_size = real.size(0)
 
-                # labelsb_size
-                real_labels = torch.ones(batch_size, device=common.DEVICE)
-                fake_labels = torch.zeros(batch_size, device=common.DEVICE)
+                if self.config.super_resolution:
+                    # Downscale the cropped image to config.input_size
+                    real_lr = self.resize_to_input(real)
+                    fake = generator(real_lr)
+                else:
+                    fake = generator(noise)
 
-                # Train Discriminator
                 optimizerD.zero_grad(set_to_none=True)
 
+                # Discriminator sees the dynamically cropped target size
                 out_real = discriminator(real)
-                loss_real = criterion(out_real, real_labels)
-
-                noise = torch.randn(
-                    batch_size,
-                    self.config.latent_vector_size,
-                    device=common.DEVICE,
-                )
-                fake = generator(noise)
-
                 out_fake = discriminator(fake.detach())
-                loss_fake = criterion(out_fake, fake_labels)
 
-                loss_d = loss_real + loss_fake
+                loss_real = criterion(
+                    out_real,
+                    torch.ones_like(out_real),
+                )
+
+                loss_fake = criterion(
+                    out_fake,
+                    torch.zeros_like(out_fake),
+                )
+
+                loss_d = 0.5 * (loss_real + loss_fake)
+
                 loss_d.backward()
                 optimizerD.step()
 
-                # Train Generator
                 optimizerG.zero_grad(set_to_none=True)
 
                 out = discriminator(fake)
-                loss_g = criterion(out, real_labels)
+
+                loss_adv = criterion(
+                    out,
+                    torch.ones_like(out),
+                )
+
+                if self.config.super_resolution:
+                    fake_lr = self.resize_to_input(fake)
+
+                    loss_reconstruction = reconstruction_criterion(
+                        fake,
+                        real,
+                    )
+
+                    loss_g = (
+                        loss_adv
+                        + self.config.reconstruction_weight * loss_reconstruction
+                    )
+
+                else:
+                    loss_reconstruction = torch.zeros(
+                        (),
+                        device=common.DEVICE,
+                    )
+
+                    loss_g = loss_adv
+
                 loss_g.backward()
                 optimizerG.step()
 
@@ -362,7 +611,28 @@ class GanTrainer:
                         f"Step [{i}/{len(dataloader)}]"
                     )
 
-                    self.print_losses(loss_d, loss_real, loss_fake, loss_g)
+                    self.print_losses(
+                        loss_d,
+                        loss_real,
+                        loss_fake,
+                        loss_g,
+                    )
+
+                    if self.config.super_resolution:
+                        avg_reconstruction = self.multi_loss_tracker.calculate_loss(
+                            "loss_reconstruction",
+                            loss_reconstruction,
+                        )
+
+                    weighted_reconstruction = (
+                        self.config.reconstruction_weight * loss_reconstruction.item()
+                    )
+                    self.logger.info(
+                        f"Reconstruction Loss (Raw): {loss_reconstruction.item():.4f} "
+                        f"(avg: {avg_reconstruction:.4f}) | "
+                        f"Weight: {self.config.reconstruction_weight:.4f} | "
+                        f"Weighted Total: {weighted_reconstruction:.4f}"
+                    )
 
                     GanTrainer.save_gan_checkpoint(
                         generator,
@@ -372,14 +642,30 @@ class GanTrainer:
                         self.config.checkpoint_path,
                     )
 
-                    image_utils.show_image_eval("real", real, loss_real)
-                    image_utils.show_image_eval("fake", fake.detach(), loss_fake)
-                    image_utils.display_images(fake.detach())
+                    image_utils.show_image_eval(
+                        "real", real, loss_real, image_size=self.config.image_size
+                    )
+
+                    image_utils.show_image_eval(
+                        "fake",
+                        fake.detach(),
+                        loss_fake,
+                        image_size=self.config.image_size,
+                    )
+
+                    image_utils.display_images(
+                        fake.detach(), image_size=self.config.image_size
+                    )
 
         self.logger.info("Training GAN done.")
 
 
 if __name__ == "__main__":
     logger = common.create_logger()
-    ganTrainer = GanTrainer.from_yaml(profile_name="gan_small", logger=logger)
+
+    ganTrainer = GanTrainer.from_yaml(
+        profile_name="srgan_256_discriminator_loss_only",
+        logger=logger,
+    )
+
     ganTrainer.train()
