@@ -242,20 +242,26 @@ def mixed_dataloader(datasets, batch_size):
     return DataLoader(mixed_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
 
-def show_image_eval(image_type, images, loss):
-    plt.figure(figsize=(1.5, 1.5))
+def show_image_eval(image_type, images, loss, image_size=32):
+    fsize = max(1.5, image_size / 32)
 
-    loss = loss.detach()
+    plt.figure(figsize=(fsize, fsize), dpi=100)
+
+    loss = loss.detach().item()
+
     if image_type == "real":
         p = math.exp(-loss)
     elif image_type == "fake":
         p = 1 - math.exp(-loss)
+    else:
+        p = 0.0
+
     img = images[0]
 
     if img.ndim == 3 and img.shape[0] in [1, 3]:
-        img = img.permute(1, 2, 0)  # -> (H, W, C)
+        img = img.permute(1, 2, 0)
 
-    # Scale [-1,1] → [0,1]
+    # Scale [-1, 1] -> [0, 1]
     img = (img + 1) / 2
 
     if img.shape[-1] == 1:
@@ -265,27 +271,36 @@ def show_image_eval(image_type, images, loss):
         cmap = None
 
     img = img.detach().cpu().numpy()
+
     plt.imshow(img, cmap=cmap)
     plt.title(f"p={p:.2f}: loss={loss:.3f}")
     plt.axis("off")
-
+    plt.tight_layout()
     plt.show()
 
 
-def display_images(generated_images, dpi=100):
-    dim = (2, 2)
-    num_images = min(len(generated_images), dim[0] * dim[1])
+def display_images(generated_images, image_size=32, dpi=100):
+    fsize = max(2, image_size / 32)
 
-    plt.figure(figsize=(2, 2), dpi=dpi)
+    rows, cols = 2, 2
+    num_images = min(len(generated_images), rows * cols)
+
+    plt.figure(
+        figsize=(fsize, fsize),
+        dpi=dpi,
+    )
 
     for i in range(num_images):
-        plt.subplot(dim[0], dim[1], i + 1)
+        plt.subplot(rows, cols, i + 1)
 
-        img = generated_images[i].permute(1, 2, 0).detach().cpu()
-        img = (img + 1) / 2
-        img = img.clamp(0, 1).numpy()
+        img = generated_images[i].detach().cpu().permute(1, 2, 0)
+        img = ((img + 1) / 2).clamp(0, 1).numpy()
 
-        plt.imshow(img)
+        if img.shape[-1] == 1:
+            plt.imshow(img.squeeze(-1), cmap="gray")
+        else:
+            plt.imshow(img)
+
         plt.axis("off")
 
     plt.tight_layout()
@@ -364,7 +379,7 @@ class ImageManager:
             )
         else:
             self.logger.info("Creating latents from dataset...")
-            dataset = image_utils.cropped_dataset(
+            dataset = cropped_dataset(
                 self.images_dir,
                 crop_size=raw_crop_size,
                 max_num_patches_per_image=1,
@@ -386,7 +401,9 @@ class ImageManager:
 
             self.logger.info(f"Saved latents to {latent_dir}")
 
-    def cache_images_from_image_dataset(self, cropped_images_path, image_size):
+    def cache_images_from_image_dataset(
+        self, cropped_images_path, image_size, grayscale=False
+    ):
         cache_file = cropped_images_path
         if os.path.exists(cache_file):
             self.logger.info(
@@ -396,11 +413,11 @@ class ImageManager:
 
         self.logger.info("Creating cached images from dataset...")
 
-        dataset = image_utils.cropped_dataset(
+        dataset = cropped_dataset(
             self.images_dir,
             crop_size=image_size,
             max_num_patches_per_image=1,
-            grayscale=True,
+            grayscale=grayscale,
         )
 
         images = []

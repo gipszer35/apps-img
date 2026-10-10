@@ -1,10 +1,27 @@
 trainers:
   gan_small:
-    image_size: 32
-    latent_vector_size: 150
     num_channel: 3
     beta: 0.5
     epoch: 5000
-    checkpoint_name: "gan_small.pt"
+    checkpoint_name: gan_small.pt
+    batch_size: 4096
+
+    image_size: 32
+    input_size: 32
+    latent_vector_size: 128
+    super_resolution: false
+
+  srgan:
+    num_channel: 3
+    beta: 0.5
+    epoch: 5000
+    checkpoint_name: srgan_256.pt
+    batch_size: 16
+    generator_base: 512
 
 
+    image_size: 256
+    input_size: 64
+    latent_vector_size: 0
+    super_resolution: true
+    reconstruction_weight: 10.0

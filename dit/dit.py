@@ -447,6 +447,7 @@ class DiffusionTrainer:
             self.image_manager.cache_images_from_image_dataset(
                 self.config.cropped_images_path,
                 self.config.image_size
+                grayscale=self.config.grayscale
             )
             cache_file = self.config.cropped_images_path
             images = torch.load(

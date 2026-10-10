@@ -9,6 +9,7 @@ import torchvision.transforms as transforms
 import torch.optim as optim
 import dataclasses
 import yaml
+from torch.utils.data import DataLoader
 
 
 class Environment:
@@ -61,7 +62,7 @@ Environment()
 
 @dataclasses.dataclass(frozen=False)
 class GanConfig:
-    # Environment paths generated automatically from the Environment Singleton
+    # Environment paths
     work_dir: str
     images_dir: str
     content_drive: str
@@ -71,21 +72,27 @@ class GanConfig:
     epoch: int
     checkpoint_name: str
 
-    # Explicit architecture and training hyperparameters
-    image_size: int
-    latent_vector_size: int
+    # Image and latent dimensions
+    image_size: int = 32
+    input_size: int = 32
+    latent_vector_size: int = 128
+    generator_base: int = 256
+    discriminator_base: int = 256
 
-    # Static constants
+    # Training mode
+    super_resolution: bool = False
+
+    # Loss weights
+    reconstruction_weight: float = 10.0
+
+    # Learning rates: change these directly in the source
     lr_generator: float = 1e-4
     lr_discriminator: float = 1e-4
 
     @classmethod
     def create(cls, **kwargs) -> "GanConfig":
-        """Factory method that dynamically resolves defaults for ALL dataclass fields."""
-
         env = Environment()
 
-        # Inject the mandatory environment paths
         kwargs.update(
             {
                 "work_dir": env.work_dir,
@@ -94,9 +101,8 @@ class GanConfig:
             }
         )
 
-        kwargs.setdefault("batch_size", 2048 if env.is_colab else 2)
+        kwargs.setdefault("batch_size", 64 if env.is_colab else 2)
 
-        # Dynamically loop through all defined fields in the class
         for field in dataclasses.fields(cls):
             if field.name not in kwargs and field.default is not dataclasses.MISSING:
                 kwargs[field.name] = field.default
@@ -108,58 +114,222 @@ class GanConfig:
         return os.path.join(self.work_dir, "out_dir")
 
     @property
-    def checkpoint_path(self) -> str:
+    def checkpoint_path(self):
         return os.path.join(self.out_dir, self.checkpoint_name)
 
     @property
-    def cropped_images_path(self) -> str:
-        return os.path.join(self.out_dir, f"cropped_{self.image_size}.pt")
+    def cropped_images_path(self):
+        return os.path.join(
+            self.out_dir,
+            f"cropped_{self.image_size}.pt",
+        )
 
 
 class Generator(nn.Module):
-    def __init__(
-        self,
-        config,
-        base=256,
-    ):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        # project latent vector to 4×4
-        self.fc = nn.Sequential(
-            nn.Linear(config.latent_vector_size, base * 4 * 4),
-        )
+        self.base = config.generator_base
 
-        # We will build: 4→8→16→32 (upsampling)
-        self.main = nn.Sequential(
-            # 4×4 → 8×8
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(base, base, kernel_size=3, padding=1, bias=False),
-            common.GaussianNoise(0.1),
-            nn.GroupNorm(32, base),
-            nn.LeakyReLU(0.2, inplace=True),
-            # 8×8 → 16×16
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(base, base // 2, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(32, base // 2),
-            nn.LeakyReLU(0.2, inplace=True),
-            # 16×16 → 32×32
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(base // 2, base // 4, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(32, base // 4),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base // 4, config.num_channel, kernel_size=3, padding=1),
-            nn.Tanh(),
-        )
+        if config.image_size < 4 or config.image_size % 4 != 0:
+            raise ValueError("image_size must be divisible by 4 and at least 4.")
 
-    def forward(self, z):
-        x = self.fc(z)
-        x = x.view(z.size(0), -1, 4, 4)
+        if config.super_resolution:
+            if config.input_size < 4:
+                raise ValueError("input_size must be at least 4.")
+
+            if config.image_size < config.input_size:
+                raise ValueError(
+                    "image_size must be >= input_size for super-resolution."
+                )
+
+            if config.image_size % config.input_size != 0:
+                raise ValueError("image_size must be divisible by input_size.")
+
+            scale = config.image_size // config.input_size
+
+            if scale & (scale - 1):
+                raise ValueError(
+                    "The super-resolution scale factor must be a power of 2."
+                )
+
+            # Encode the low-resolution image.
+            self.input_conv = nn.Sequential(
+                nn.Conv2d(
+                    config.num_channel,
+                    self.base // 4,
+                    kernel_size=3,
+                    padding=1,
+                ),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(
+                    self.base // 4,
+                    self.base // 2,
+                    kernel_size=3,
+                    padding=1,
+                ),
+                nn.LeakyReLU(0.2, inplace=True),
+            )
+
+            # Optional additional latent vector.
+            if config.latent_vector_size > 0:
+                self.latent_fc = nn.Linear(
+                    config.latent_vector_size,
+                    self.base // 2,
+                )
+
+            # Project encoded features to the decoder's channels.
+            self.input_projection = nn.Conv2d(
+                self.base // 2,
+                self.base,
+                kernel_size=3,
+                padding=1,
+            )
+
+            # Build the super-resolution decoder during initialization.
+            # This ensures all parameters are registered before the
+            # optimizer is created.
+            decoder_layers = []
+            channels = self.base
+            current_size = config.input_size
+
+            while current_size < config.image_size:
+                next_channels = max(
+                    self.base // 4,
+                    channels // 2,
+                )
+
+                decoder_layers.extend(
+                    [
+                        nn.Upsample(
+                            scale_factor=2,
+                            mode="nearest",
+                        ),
+                        nn.Conv2d(
+                            channels,
+                            next_channels,
+                            kernel_size=3,
+                            padding=1,
+                            bias=False,
+                        ),
+                        nn.GroupNorm(
+                            min(32, next_channels),
+                            next_channels,
+                        ),
+                        nn.LeakyReLU(0.2, inplace=True),
+                    ]
+                )
+
+                channels = next_channels
+                current_size *= 2
+
+            decoder_layers.extend(
+                [
+                    nn.Conv2d(
+                        channels,
+                        config.num_channel,
+                        kernel_size=3,
+                        padding=1,
+                    ),
+                    nn.Tanh(),
+                ]
+            )
+
+            self.sr_decoder = nn.Sequential(*decoder_layers)
+
+        else:
+            # Unconditional GAN architecture.
+            self.fc = nn.Linear(
+                config.latent_vector_size,
+                self.base * 4 * 4,
+            )
+
+            layers = []
+            channels = self.base
+            current_size = 4
+
+            while current_size < config.image_size:
+                next_channels = max(
+                    self.base // 4,
+                    channels // 2,
+                )
+
+                layers.extend(
+                    [
+                        nn.Upsample(
+                            scale_factor=2,
+                            mode="nearest",
+                        ),
+                        nn.Conv2d(
+                            channels,
+                            next_channels,
+                            kernel_size=3,
+                            padding=1,
+                            bias=False,
+                        ),
+                        nn.GroupNorm(
+                            min(32, next_channels),
+                            next_channels,
+                        ),
+                        nn.LeakyReLU(0.2, inplace=True),
+                    ]
+                )
+
+                channels = next_channels
+                current_size *= 2
+
+            layers.extend(
+                [
+                    nn.Conv2d(
+                        channels,
+                        config.num_channel,
+                        kernel_size=3,
+                        padding=1,
+                    ),
+                    nn.Tanh(),
+                ]
+            )
+
+            self.main = nn.Sequential(*layers)
+
+    def forward(self, x, z=None):
+        if self.config.super_resolution:
+            # x: (B, C, input_size, input_size)
+            x = self.input_conv(x)
+
+            # Optionally inject additional latent information.
+            if self.config.latent_vector_size > 0:
+                if z is None:
+                    z = torch.randn(
+                        x.size(0),
+                        self.config.latent_vector_size,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+
+                latent = self.latent_fc(z)
+                latent = latent.unsqueeze(-1).unsqueeze(-1)
+
+                # Broadcast latent information over spatial dimensions.
+                x = x + latent
+
+            x = self.input_projection(x)
+
+            # input_size -> image_size
+            return self.sr_decoder(x)
+
+        # Original unconditional GAN mode.
+        x = self.fc(x)
+        x = x.view(x.size(0), self.base, 4, 4)
+
         return self.main(x)
 
 
 class Discriminator(nn.Module):
-    def __init__(self, config, base=256):
+    def __init__(self, config):
         super().__init__()
+        self.config = config
+        self.base = config.discriminator_base
 
         def block(in_c, out_c):
             return nn.Sequential(
@@ -171,23 +341,45 @@ class Discriminator(nn.Module):
                     padding=1,
                 ),
                 common.GaussianNoise(0.1),
-                nn.GroupNorm(32, out_c),
+                nn.GroupNorm(
+                    min(32, out_c),
+                    out_c,
+                ),
                 nn.LeakyReLU(0.2, inplace=True),
             )
 
-        self.blocks = nn.Sequential(
-            block(config.num_channel, base // 4),  # 32 -> 16
-            block(base // 4, base // 2),  # 16 -> 8
-            block(base // 2, base),  # 8 -> 4
-            block(base, base * 2),  # 4 -> 2
-        )
+        channels = [
+            max(self.base // 4, 32),
+            max(self.base // 2, 32),
+            self.base,
+            self.base * 2,
+        ]
 
-        self.final = nn.Conv2d(base * 2, 1, kernel_size=2)  # 2 -> 1
+        layers = []
+        in_channels = config.num_channel
+
+        current_size = config.image_size
+
+        for out_channels in channels:
+            if current_size < 2:
+                break
+
+            layers.append(block(in_channels, out_channels))
+
+            in_channels = out_channels
+            current_size //= 2
+
+        self.blocks = nn.Sequential(*layers)
+
+        self.final = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, 1),
+        )
 
     def forward(self, x):
         x = self.blocks(x)
-        x = self.final(x)
-        return x.view(x.size(0))
+        return self.final(x).view(-1)
 
 
 class GanTrainer:
@@ -195,6 +387,7 @@ class GanTrainer:
         self.logger = logger
         self.config = config
         self.multi_loss_tracker = common.MultiLossTracker()
+        self.image_manager = image_utils.ImageManager(logger, config.images_dir)
 
         if not os.path.exists(self.config.out_dir):
             self.logger.info(f"Creating output directory: {self.config.out_dir}")
@@ -240,7 +433,55 @@ class GanTrainer:
         else:
             print(f"No checkpoint found at {path}, skipping load.")
 
-    def prepare_dataloader(self):
+    def resize_to_input(self, images):
+        return nn.functional.interpolate(
+            images,
+            size=(
+                self.config.input_size,
+                self.config.input_size,
+            ),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+
+    def prepare_cropped_image_dataloader(self):
+        self.logger.info("Creating dataset and preparing dataloader...")
+
+        self.image_manager.cache_images_from_image_dataset(
+            self.config.cropped_images_path, self.config.image_size
+        )
+        cache_file = self.config.cropped_images_path
+        images = torch.load(
+            cache_file,
+            map_location="cpu",
+        )
+        transform = transforms.Compose(
+            [
+                image_utils.Random90Rotation(),
+                transforms.Normalize(
+                    mean=[0.5] * self.config.num_channel,
+                    std=[0.5] * self.config.num_channel,
+                ),
+            ]
+        )
+
+        dataset = image_utils.ImageManager.CachedImageDataset(
+            images,
+            transform=transform,
+        )
+
+        self.logger.info(
+            f"Dataloader successfully initialized with {len(dataset)} samples."
+        )
+
+        return DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+        )
+
+    def prepare_cifar_dataloader(self):
         self.logger.info("Preparing datasets and dataloader")
 
         cifar_cache_path = os.path.join(self.config.out_dir, "cifar100_dataset.pt")
@@ -289,19 +530,23 @@ class GanTrainer:
     def train(self):
         generator = Generator(self.config).to(common.DEVICE)
         discriminator = Discriminator(self.config).to(common.DEVICE)
+
         criterion = nn.BCEWithLogitsLoss()
+        reconstruction_criterion = nn.L1Loss()
+
         optimizerD = optim.Adam(
             discriminator.parameters(),
             lr=self.config.lr_discriminator,
             betas=(self.config.beta, 0.999),
         )
+
         optimizerG = optim.Adam(
             generator.parameters(),
             lr=self.config.lr_generator,
             betas=(self.config.beta, 0.999),
         )
 
-        dataloader = self.prepare_dataloader()
+        dataloader = self.prepare_cropped_image_dataloader()
 
         GanTrainer.load_gan_checkpoint_if_exists(
             generator,
@@ -310,46 +555,96 @@ class GanTrainer:
             optimizerD,
             self.config.checkpoint_path,
         )
-        logger.info("Generator")
+
+        self.logger.info("Generator")
         common.print_parameter_summary(generator)
-        logger.info("Discriminator")
+
+        self.logger.info("Discriminator")
         common.print_parameter_summary(discriminator)
 
-        # Training loop
+        i=-1
         for epoch in range(self.config.epoch):
-            for i, (images, _) in enumerate(dataloader):
+            for batch in dataloader:
+                i+=1
+                images = batch[0] if isinstance(batch, (tuple, list)) else batch
                 real = images.to(common.DEVICE)
                 batch_size = real.size(0)
 
-                # labelsb_size
-                real_labels = torch.ones(batch_size, device=common.DEVICE)
-                fake_labels = torch.zeros(batch_size, device=common.DEVICE)
+                if self.config.super_resolution:
+                    real_lr = self.resize_to_input(real)
 
-                # Train Discriminator
+                    z = None
+
+                    if self.config.latent_vector_size > 0:
+                        z = torch.randn(
+                            batch_size,
+                            self.config.latent_vector_size,
+                            device=common.DEVICE,
+                        )
+
+                    fake = generator(real_lr, z)
+
+                else:
+                    real_lr = None
+
+                    noise = torch.randn(
+                        batch_size,
+                        self.config.latent_vector_size,
+                        device=common.DEVICE,
+                    )
+
+                    fake = generator(noise)
+
                 optimizerD.zero_grad(set_to_none=True)
 
                 out_real = discriminator(real)
-                loss_real = criterion(out_real, real_labels)
-
-                noise = torch.randn(
-                    batch_size,
-                    self.config.latent_vector_size,
-                    device=common.DEVICE,
-                )
-                fake = generator(noise)
-
                 out_fake = discriminator(fake.detach())
-                loss_fake = criterion(out_fake, fake_labels)
 
-                loss_d = loss_real + loss_fake
+                loss_real = criterion(
+                    out_real,
+                    torch.ones_like(out_real),
+                )
+
+                loss_fake = criterion(
+                    out_fake,
+                    torch.zeros_like(out_fake),
+                )
+
+                loss_d = 0.5 * (loss_real + loss_fake)
+
                 loss_d.backward()
                 optimizerD.step()
 
-                # Train Generator
                 optimizerG.zero_grad(set_to_none=True)
 
                 out = discriminator(fake)
-                loss_g = criterion(out, real_labels)
+
+                loss_adv = criterion(
+                    out,
+                    torch.ones_like(out),
+                )
+
+                if self.config.super_resolution:
+                    fake_lr = self.resize_to_input(fake)
+
+                    loss_reconstruction = reconstruction_criterion(
+                        fake_lr,
+                        real_lr,
+                    )
+
+                    loss_g = (
+                        loss_adv
+                        + self.config.reconstruction_weight * loss_reconstruction
+                    )
+
+                else:
+                    loss_reconstruction = torch.zeros(
+                        (),
+                        device=common.DEVICE,
+                    )
+
+                    loss_g = loss_adv
+
                 loss_g.backward()
                 optimizerG.step()
 
@@ -362,7 +657,24 @@ class GanTrainer:
                         f"Step [{i}/{len(dataloader)}]"
                     )
 
-                    self.print_losses(loss_d, loss_real, loss_fake, loss_g)
+                    self.print_losses(
+                        loss_d,
+                        loss_real,
+                        loss_fake,
+                        loss_g,
+                    )
+
+                    if self.config.super_resolution:
+                        avg_reconstruction = self.multi_loss_tracker.calculate_loss(
+                            "loss_reconstruction",
+                            loss_reconstruction,
+                        )
+
+                        self.logger.info(
+                            f"Reconstruction Loss: "
+                            f"{loss_reconstruction.item():.4f} "
+                            f"(avg: {avg_reconstruction:.4f})"
+                        )
 
                     GanTrainer.save_gan_checkpoint(
                         generator,
@@ -372,14 +684,30 @@ class GanTrainer:
                         self.config.checkpoint_path,
                     )
 
-                    image_utils.show_image_eval("real", real, loss_real)
-                    image_utils.show_image_eval("fake", fake.detach(), loss_fake)
-                    image_utils.display_images(fake.detach())
+                    image_utils.show_image_eval(
+                        "real", real, loss_real, image_size=self.config.image_size
+                    )
+
+                    image_utils.show_image_eval(
+                        "fake",
+                        fake.detach(),
+                        loss_fake,
+                        image_size=self.config.image_size,
+                    )
+
+                    image_utils.display_images(
+                        fake.detach(), image_size=self.config.image_size
+                    )
 
         self.logger.info("Training GAN done.")
 
 
 if __name__ == "__main__":
     logger = common.create_logger()
-    ganTrainer = GanTrainer.from_yaml(profile_name="gan_small", logger=logger)
+
+    ganTrainer = GanTrainer.from_yaml(
+        profile_name="srgan",
+        logger=logger,
+    )
+
     ganTrainer.train()
