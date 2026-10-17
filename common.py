@@ -105,7 +105,7 @@ class GaussianNoise(nn.Module):
         self.sigma = sigma
 
     def forward(self, x):
-        if self.training and self.sigma > 0:
+        if self.sigma > 0:
             noise = torch.randn_like(x)
             return x * (1 - self.sigma) + noise * self.sigma
         return x

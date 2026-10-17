@@ -1,10 +1,18 @@
 trainers:
+
+  dummy_300:
+    num_channel: 3
+    beta: 0.5
+    epoch: 5000
+    image_size: 300
+    checkpoint_name: dummy_300.pt
+
   srgan_128:
     num_channel: 3
     beta: 0.5
     epoch: 5000
     checkpoint_name: srgan_128.pt
-    batch_size: 8
+    batch_size: 96
     generator_base: 512
     discriminator_base: 256
     lr_generator: 0.00003
@@ -14,3 +22,55 @@ trainers:
     latent_vector_size: 0
     super_resolution: true
     reconstruction_weight: 1.0
+    cropped_filename: "ImageNetTest_cropped_300.pt"
+
+  gan_128_from_noise:
+    num_channel: 3
+    beta: 0.5
+    epoch: 5000
+    checkpoint_name: gan_128_from_noise.pt
+    batch_size: 64
+    generator_base: 768
+    discriminator_base: 256
+    lr_generator: 0.00003
+    lr_discriminator: 0.00003
+    image_size: 128
+    input_size: 32
+    latent_vector_size: 0
+    super_resolution: false
+    reconstruction_weight: 0
+    cropped_filename: "ImageNetTest_cropped_300.pt"
+
+  srgan_256:
+    num_channel: 3
+    beta: 0.5
+    epoch: 5000
+    checkpoint_name: srgan_256.pt
+    batch_size: 3
+    generator_base: 1024
+    discriminator_base: 256
+    lr_generator: 0.00003
+    lr_discriminator: 0.00003
+    image_size: 256
+    input_size: 64
+    latent_vector_size: 0
+    super_resolution: true
+    reconstruction_weight: 1
+    cropped_filename: "ImageNetTest_cropped_300.pt"
+
+  gan_256_from_noise:
+    num_channel: 3
+    beta: 0.5
+    epoch: 5000
+    checkpoint_name: gan_256_from_noise.pt
+    batch_size: 9
+    generator_base: 1024
+    discriminator_base: 256
+    lr_generator: 0.00003
+    lr_discriminator: 0.00003
+    image_size: 256
+    input_size: 64
+    latent_vector_size: 0
+    super_resolution: false
+    reconstruction_weight: 0
+    cropped_filename: "ImageNetTest_cropped_300.pt"

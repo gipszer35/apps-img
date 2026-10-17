@@ -10,6 +10,8 @@ import torch.optim as optim
 import dataclasses
 import yaml
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from contextlib import contextmanager
 
 
 class Environment:
@@ -31,16 +33,15 @@ class Environment:
             self._mount_colab()
             self.root_dir = os.path.join(self.content_drive, "MyDrive")
             self.apps_img = os.path.join(self.root_dir, "apps-img")
-            self.images_dir = os.path.join(self.root_dir, "images_few")
+            self.images_dir = os.path.join(self.root_dir, "images")
         else:
             self.root_dir = os.path.expanduser("~/work")
             self.apps_img = os.path.join(self.root_dir, "apps-img")
-            self.images_dir = os.path.join(self.apps_img, "images", "my-images")
+            self.images_dir = os.path.join(self.apps_img, "images", "images")
         self.work_dir = os.path.join(self.apps_img, "gan")
 
         # Update sys.path so Python knows where to look for imports
         sys.path.extend([self.root_dir, self.apps_img, self.work_dir])
-
         # Import the modules inside and inject them into the global namespace
         import common
         import image_utils
@@ -76,7 +77,7 @@ class GanConfig:
     image_size: int = 32
     input_size: int = 32
     latent_vector_size: int = 128
-    generator_base: int = 512
+    generator_base: int = 256
     discriminator_base: int = 256
 
     # Training mode
@@ -88,6 +89,9 @@ class GanConfig:
     # Learning rates: change these directly in the source
     lr_generator: float = 1e-4
     lr_discriminator: float = 1e-4
+
+    # Optional dataset tracking parameters
+    cropped_filename: str = None
 
     @classmethod
     def create(cls, **kwargs) -> "GanConfig":
@@ -119,28 +123,53 @@ class GanConfig:
 
     @property
     def cropped_images_path(self):
-        return os.path.join(
-            self.out_dir,
-            f"cropped_{self.image_size}.pt",
-        )
+        # Determine the filename dynamically or fallback to the config value
+        filename = self.cropped_filename
+        if filename is None:
+            filename = f"cropped_{self.image_size}.pt"
+
+        return os.path.join(self.out_dir, filename)
 
 
 class StochasticResidualBlock(nn.Module):
-    """Residual block with mid-block stochastic noise injection for texture generation."""
+    """
+    Residual block with mid-block stochastic noise injection for texture generation.
+    Supports dynamic noise intensity via initialization parameters.
+    """
 
-    def __init__(self, channels):
+    def __init__(self, channels, noise_sigma=0.03):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            GaussianNoise(0.03),
-            nn.GroupNorm(min(32, channels), channels),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(32, channels), channels),
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            # Inject Gaussian noise using the dynamically provided sigma value
+            common.GaussianNoise(sigma=noise_sigma),
+            nn.GroupNorm(
+                min(32, channels),
+                channels,
+            ),
+            nn.LeakyReLU(0.2, inplace=False),
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                max(8, min(32, channels)),
+                channels,
+            ),
         )
 
     def forward(self, x):
-        return x + self.block(x)
+        # Assuming standard residual skip-connection logic
+        return F.leaky_relu(x + self.block(x), negative_slope=0.2)
 
 
 class Generator(nn.Module):
@@ -162,17 +191,24 @@ class Generator(nn.Module):
         self.input_conv = nn.Sequential(
             nn.Conv2d(
                 config.num_channel,
-                self.base // 4,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(
-                self.base // 4,
                 self.base // 2,
                 kernel_size=3,
                 padding=1,
+                bias=False,
             ),
+            nn.GroupNorm(
+                max(8, min(32, self.base // 2)),
+                self.base // 2,
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(
+                self.base // 2,
+                self.base,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(max(8, min(32, self.base)), self.base),
             nn.LeakyReLU(0.2, inplace=True),
         )
 
@@ -185,14 +221,13 @@ class Generator(nn.Module):
             stage_sizes.append(current_size)
 
         num_stages = len(stage_sizes)
-        channels = self.base // 2
+        channels = self.base
         decoder_layers = []
 
-        # Add ResNet block after each upsampling stage
+        # Add ResNet blocks with progressive noise after each upsampling stage
         for i in range(num_stages):
-            next_channels = max(self.base // 4, channels // 2)
+            next_channels = max(self.base // 2, channels // 2)
 
-            # Upsampling stage
             decoder_layers.extend(
                 [
                     nn.Upsample(
@@ -210,18 +245,19 @@ class Generator(nn.Module):
                         min(32, next_channels),
                         next_channels,
                     ),
-                    nn.LeakyReLU(0.2, inplace=True),
+                    common.GaussianNoise(0.01),
+                    nn.LeakyReLU(0.2, inplace=False),
                 ]
             )
 
             channels = next_channels
 
-            # ResNet block after upsampling
-            decoder_layers.append(StochasticResidualBlock(channels))
+            # Apply progressive refinement blocks using the helper function
+            self.append_refinement_stage(decoder_layers, channels)
 
         # Fallback if input and output sizes are already equal (no upsampling needed)
         if num_stages == 0:
-            decoder_layers.append(StochasticResidualBlock(channels))
+            self.append_refinement_stage(decoder_layers, channels)
 
         # Final output projection
         decoder_layers.extend(
@@ -237,6 +273,11 @@ class Generator(nn.Module):
         )
 
         self.decoder = nn.Sequential(*decoder_layers)
+
+    # Helper function to append 3 refinement blocks with progressive noise sigmas
+    def append_refinement_stage(self, layers, ch):
+        sigmas = [0.02, 0.01, 0.0]
+        layers.extend([StochasticResidualBlock(ch, noise_sigma=s) for s in sigmas])
 
     def forward(self, x=None):
         # Generate Gaussian noise if no input is provided
@@ -283,8 +324,9 @@ class Discriminator(nn.Module):
             max(self.base // 2, 32),
             self.base,
             self.base * 2,
+            self.base * 2,
             self.base * 4,
-            self.base * 8,
+            self.base * 4,
         ]
 
         layers = []
@@ -293,7 +335,7 @@ class Discriminator(nn.Module):
         current_size = config.image_size
 
         for out_channels in channels:
-            if current_size < 2:
+            if current_size < 4:
                 break
 
             layers.append(block(in_channels, out_channels))
@@ -365,6 +407,17 @@ class GanTrainer:
         else:
             print(f"No checkpoint found at {path}, skipping load.")
 
+    @staticmethod
+    @contextmanager
+    def eval_mode(model):
+        was_training = model.training
+        model.eval()
+        try:
+            yield
+        finally:
+            if was_training:
+                model.train()
+
     def resize_to_input(self, images):
         return nn.functional.interpolate(
             images,
@@ -379,6 +432,7 @@ class GanTrainer:
 
     def prepare_cropped_image_dataloader(self):
         self.logger.info("Creating dataset and preparing dataloader...")
+        self.logger.info(f"{self.config.cropped_images_path}")
 
         self.image_manager.cache_images_from_image_dataset(
             self.config.cropped_images_path, self.config.image_size
@@ -391,11 +445,6 @@ class GanTrainer:
         transform = transforms.Compose(
             [
                 image_utils.Random90Rotation(),
-                transforms.RandomAffine(
-                    degrees=0,
-                    translate=(0.04, 0.04),
-                    fill=0,
-                ),
                 transforms.Normalize(
                     mean=[0.5] * self.config.num_channel,
                     std=[0.5] * self.config.num_channel,
@@ -546,33 +595,28 @@ class GanTrainer:
                     real_lr = self.resize_to_input(real)
                     fake = generator(real_lr)
                 else:
-                    fake = generator(noise)
+                    fake = generator()
 
                 optimizerD.zero_grad(set_to_none=True)
 
                 # Discriminator sees the dynamically cropped target size
                 out_real = discriminator(real)
                 out_fake = discriminator(fake.detach())
-
                 loss_real = criterion(
                     out_real,
                     torch.ones_like(out_real),
                 )
-
                 loss_fake = criterion(
                     out_fake,
                     torch.zeros_like(out_fake),
                 )
 
                 loss_d = 0.5 * (loss_real + loss_fake)
-
                 loss_d.backward()
                 optimizerD.step()
 
                 optimizerG.zero_grad(set_to_none=True)
-
                 out = discriminator(fake)
-
                 loss_adv = criterion(
                     out,
                     torch.ones_like(out),
@@ -580,12 +624,10 @@ class GanTrainer:
 
                 if self.config.super_resolution:
                     fake_lr = self.resize_to_input(fake)
-
                     loss_reconstruction = reconstruction_criterion(
                         fake,
                         real,
                     )
-
                     loss_g = (
                         loss_adv
                         + self.config.reconstruction_weight * loss_reconstruction
@@ -596,66 +638,69 @@ class GanTrainer:
                         (),
                         device=common.DEVICE,
                     )
-
                     loss_g = loss_adv
 
                 loss_g.backward()
                 optimizerG.step()
 
-                if i % 500 == 0:
-                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if i % 300 == 0:
+                    with torch.no_grad(), self.eval_mode(generator), self.eval_mode(
+                        discriminator
+                    ):
+                        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    self.logger.info(
-                        f"Time: {now} | "
-                        f"Epoch [{epoch + 1}/{self.config.epoch}] | "
-                        f"Step [{i}/{len(dataloader)}]"
-                    )
-
-                    self.print_losses(
-                        loss_d,
-                        loss_real,
-                        loss_fake,
-                        loss_g,
-                    )
-
-                    if self.config.super_resolution:
-                        avg_reconstruction = self.multi_loss_tracker.calculate_loss(
-                            "loss_reconstruction",
-                            loss_reconstruction,
+                        self.logger.info(
+                            f"Time: {now} | "
+                            f"Epoch [{epoch + 1}/{self.config.epoch}] | "
+                            f"Step [{i}/{len(dataloader)}]"
                         )
 
-                    weighted_reconstruction = (
-                        self.config.reconstruction_weight * loss_reconstruction.item()
-                    )
-                    self.logger.info(
-                        f"Reconstruction Loss (Raw): {loss_reconstruction.item():.4f} "
-                        f"(avg: {avg_reconstruction:.4f}) | "
-                        f"Weight: {self.config.reconstruction_weight:.4f} | "
-                        f"Weighted Total: {weighted_reconstruction:.4f}"
-                    )
+                        self.print_losses(
+                            loss_d,
+                            loss_real,
+                            loss_fake,
+                            loss_g,
+                        )
 
-                    GanTrainer.save_gan_checkpoint(
-                        generator,
-                        optimizerG,
-                        discriminator,
-                        optimizerD,
-                        self.config.checkpoint_path,
-                    )
+                        if self.config.super_resolution:
+                            avg_reconstruction = self.multi_loss_tracker.calculate_loss(
+                                "loss_reconstruction",
+                                loss_reconstruction,
+                            )
 
-                    image_utils.show_image_eval(
-                        "real", real, loss_real, image_size=self.config.image_size
-                    )
+                            weighted_reconstruction = (
+                                self.config.reconstruction_weight
+                                * loss_reconstruction.item()
+                            )
+                            self.logger.info(
+                                f"Reconstruction Loss (Raw): {loss_reconstruction.item():.4f} "
+                                f"(avg: {avg_reconstruction:.4f}) | "
+                                f"Weight: {self.config.reconstruction_weight:.4f} | "
+                                f"Weighted Total: {weighted_reconstruction:.4f}"
+                            )
 
-                    image_utils.show_image_eval(
-                        "fake",
-                        fake.detach(),
-                        loss_fake,
-                        image_size=self.config.image_size,
-                    )
+                        GanTrainer.save_gan_checkpoint(
+                            generator,
+                            optimizerG,
+                            discriminator,
+                            optimizerD,
+                            self.config.checkpoint_path,
+                        )
 
-                    image_utils.display_images(
-                        fake.detach(), image_size=self.config.image_size
-                    )
+                        image_utils.show_image_eval(
+                            "real", real, loss_real, image_size=self.config.image_size
+                        )
+
+                        image_utils.show_image_eval(
+                            "fake",
+                            fake.detach(),
+                            loss_fake,
+                            image_size=self.config.image_size,
+                        )
+
+                        image_utils.display_images(
+                            fake.detach(), image_size=self.config.image_size
+                        )
 
         self.logger.info("Training GAN done.")
 
@@ -664,7 +709,7 @@ if __name__ == "__main__":
     logger = common.create_logger()
 
     ganTrainer = GanTrainer.from_yaml(
-        profile_name="srgan_256_discriminator_loss_only",
+        profile_name="gan_256_from_noise",
         logger=logger,
     )
 
