@@ -4,7 +4,7 @@ trainers:
     beta: 0.5
     epoch: 5000
     checkpoint_name: srgan_128.pt
-    batch_size: 8
+    batch_size: 36
     generator_base: 512
     discriminator_base: 256
     lr_generator: 0.00003

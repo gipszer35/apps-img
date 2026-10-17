@@ -76,7 +76,7 @@ class GanConfig:
     image_size: int = 32
     input_size: int = 32
     latent_vector_size: int = 128
-    generator_base: int = 512
+    generator_base: int = 256
     discriminator_base: int = 256
 
     # Training mode
@@ -126,20 +126,43 @@ class GanConfig:
 
 
 class StochasticResidualBlock(nn.Module):
-    """Residual block with mid-block stochastic noise injection for texture generation."""
+    """
+    Residual block with mid-block stochastic noise injection for texture generation.
+    Supports dynamic noise intensity via initialization parameters.
+    """
 
-    def __init__(self, channels):
+    def __init__(self, channels, noise_sigma=0.03):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            GaussianNoise(0.03),
-            nn.GroupNorm(min(32, channels), channels),
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            # Inject Gaussian noise using the dynamically provided sigma value
+            common.GaussianNoise(sigma=noise_sigma),
+            nn.GroupNorm(
+                min(32, channels),
+                channels,
+            ),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(32, channels), channels),
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                min(32, channels),
+                channels,
+            ),
         )
 
     def forward(self, x):
+        # Assuming standard residual skip-connection logic
         return x + self.block(x)
 
 
@@ -162,14 +185,14 @@ class Generator(nn.Module):
         self.input_conv = nn.Sequential(
             nn.Conv2d(
                 config.num_channel,
-                self.base // 4,
+                self.base // 2,
                 kernel_size=3,
                 padding=1,
             ),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(
-                self.base // 4,
                 self.base // 2,
+                self.base,
                 kernel_size=3,
                 padding=1,
             ),
@@ -185,12 +208,12 @@ class Generator(nn.Module):
             stage_sizes.append(current_size)
 
         num_stages = len(stage_sizes)
-        channels = self.base // 2
+        channels = self.base
         decoder_layers = []
 
-        # Add ResNet block after each upsampling stage
+        # Add ResNet blocks with progressive noise after each upsampling stage
         for i in range(num_stages):
-            next_channels = max(self.base // 4, channels // 2)
+            next_channels = max(self.base // 2, channels // 2)
 
             # Upsampling stage
             decoder_layers.extend(
@@ -199,6 +222,7 @@ class Generator(nn.Module):
                         scale_factor=2,
                         mode="nearest",
                     ),
+                    common.GaussianNoise(0.03),
                     nn.Conv2d(
                         channels,
                         next_channels,
@@ -216,12 +240,12 @@ class Generator(nn.Module):
 
             channels = next_channels
 
-            # ResNet block after upsampling
-            decoder_layers.append(StochasticResidualBlock(channels))
+            # Apply progressive refinement blocks using the helper function
+            self.append_refinement_stage(decoder_layers, channels)
 
         # Fallback if input and output sizes are already equal (no upsampling needed)
         if num_stages == 0:
-            decoder_layers.append(StochasticResidualBlock(channels))
+            self.append_refinement_stage(decoder_layers, channels)
 
         # Final output projection
         decoder_layers.extend(
@@ -237,6 +261,11 @@ class Generator(nn.Module):
         )
 
         self.decoder = nn.Sequential(*decoder_layers)
+
+    # Helper function to append 3 refinement blocks with progressive noise sigmas
+    def append_refinement_stage(self, layers, ch):
+        sigmas = [0.04, 0.01, 0.0]
+        layers.extend([StochasticResidualBlock(ch, noise_sigma=s) for s in sigmas])
 
     def forward(self, x=None):
         # Generate Gaussian noise if no input is provided
@@ -282,6 +311,7 @@ class Discriminator(nn.Module):
             max(self.base // 4, 32),
             max(self.base // 2, 32),
             self.base,
+            self.base,
             self.base * 2,
             self.base * 4,
             self.base * 8,
@@ -293,7 +323,7 @@ class Discriminator(nn.Module):
         current_size = config.image_size
 
         for out_channels in channels:
-            if current_size < 2:
+            if current_size < 4:
                 break
 
             layers.append(block(in_channels, out_channels))
@@ -553,26 +583,21 @@ class GanTrainer:
                 # Discriminator sees the dynamically cropped target size
                 out_real = discriminator(real)
                 out_fake = discriminator(fake.detach())
-
                 loss_real = criterion(
                     out_real,
                     torch.ones_like(out_real),
                 )
-
                 loss_fake = criterion(
                     out_fake,
                     torch.zeros_like(out_fake),
                 )
 
                 loss_d = 0.5 * (loss_real + loss_fake)
-
                 loss_d.backward()
                 optimizerD.step()
 
                 optimizerG.zero_grad(set_to_none=True)
-
                 out = discriminator(fake)
-
                 loss_adv = criterion(
                     out,
                     torch.ones_like(out),
@@ -580,12 +605,10 @@ class GanTrainer:
 
                 if self.config.super_resolution:
                     fake_lr = self.resize_to_input(fake)
-
                     loss_reconstruction = reconstruction_criterion(
                         fake,
                         real,
                     )
-
                     loss_g = (
                         loss_adv
                         + self.config.reconstruction_weight * loss_reconstruction
@@ -596,13 +619,12 @@ class GanTrainer:
                         (),
                         device=common.DEVICE,
                     )
-
                     loss_g = loss_adv
 
                 loss_g.backward()
                 optimizerG.step()
 
-                if i % 500 == 0:
+                if i % 50 == 0:
                     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     self.logger.info(
@@ -664,7 +686,7 @@ if __name__ == "__main__":
     logger = common.create_logger()
 
     ganTrainer = GanTrainer.from_yaml(
-        profile_name="srgan_256_discriminator_loss_only",
+        profile_name="srgan_128",
         logger=logger,
     )
 
