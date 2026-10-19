@@ -1,12 +1,5 @@
 trainers:
 
-  dummy_300:
-    num_channel: 3
-    beta: 0.5
-    epoch: 5000
-    image_size: 300
-    checkpoint_name: dummy_300.pt
-
   srgan_128:
     num_channel: 3
     beta: 0.5
